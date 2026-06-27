@@ -1,0 +1,9 @@
+[project]
+name = "rssync"
+version = "0.1.0"
+description = "A GitHub Action workflow to automatically fetch and archive RSS feeds in Git."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.34.2",
+]
