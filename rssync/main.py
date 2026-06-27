@@ -2,10 +2,14 @@ import io
 import re
 import sys
 import shutil
+import json
 import hashlib
 import os.path
 import logging
-from urllib.parse import urlparse
+import time
+import random
+import pprint
+from urllib.parse import urlparse, unquote
 from urllib3.util import Retry
 
 import requests
@@ -47,9 +51,10 @@ def md5sum(data: bytes):
 
 def fetch_rss_xml(url, basepath='.'):
     resp = se.get(url)
+    resp.raise_for_status()
     parse_result = urlparse(url)
-    relpath = os.path.join(basepath, parse_result.netloc,
-                           parse_result.path.removeprefix('/'))
+    urlpath = unquote(parse_result.path.removeprefix('/'))
+    relpath = os.path.join(basepath, parse_result.netloc, urlpath)
     ensure_file_directory(relpath)
     with open(relpath, 'wb') as fp:
         fp.write(resp.content)
@@ -68,13 +73,29 @@ def is_duplicate_rss_file(rss_file1, rss_file2):
 
 def main(args=None):
     args = args or sys.argv
+    match len(args):
+        case 0 | 1:
+            config_file = os.path.relpath('rssync-config.json')
+        case _:
+            config_file = args[1]
+
+    with open(config_file, 'r') as fp:
+        config_data = json.load(fp)
+    feed_urls = config_data['feeds']
+
     new_rss_files = []
-    for u in sys.argv[1:]:
+    err_rss_urls = []
+    random.shuffle(feed_urls)
+
+    for u in feed_urls:
         try:
             relpath = fetch_rss_xml(u, RSS_FEED_NEW_PATH)
             new_rss_files.append(relpath)
         except Exception as e:
-            logger.error('Fetch failed to {} [{}]', relpath, u, exc_info=True)
+            logger.error('Fetch failed to %s [%s]', relpath, u, exc_info=True)
+            err_rss_urls.append(u)
+        time.sleep(3)
+
     for f in new_rss_files:
         target_file = os.path.join(
                 RSS_FEED_PATH, f.removeprefix(RSS_FEED_NEW_PATH).removeprefix('/'))
@@ -82,6 +103,8 @@ def main(args=None):
             continue
         ensure_file_directory(target_file)
         shutil.copyfile(f, target_file)
+    if err_rss_urls:
+        logger.warning('Failed to retrieve URLs: %s', pprint.pformat(err_rss_urls))
 
 
 if __name__ == '__main__':
