@@ -1,3 +1,4 @@
+import concurrent.futures
 import io
 import re
 import sys
@@ -54,11 +55,13 @@ def fetch_rss_xml(url, basepath='.'):
     resp.raise_for_status()
     parse_result = urlparse(url)
     urlpath = unquote(parse_result.path.removeprefix('/'))
-    relpath = os.path.join(basepath, parse_result.netloc, urlpath)
-    ensure_file_directory(relpath)
-    with open(relpath, 'wb') as fp:
+    relpath = os.path.join(parse_result.netloc, urlpath)
+    target_path = os.path.join(basepath, relpath)
+    ensure_file_directory(target_path)
+    with open(target_path, 'wb') as fp:
         fp.write(resp.content)
-    return relpath
+    print(target_path, relpath, len(resp.content))
+    return target_path, relpath
 
 
 def is_duplicate_rss_file(rss_file1, rss_file2):
@@ -69,6 +72,21 @@ def is_duplicate_rss_file(rss_file1, rss_file2):
         data1 = p.sub(data1, b'')
         data2 = p.sub(data2, b'')
     return md5sum(data1) == md5sum(data2)
+
+
+def rss_update_worker(url, temp_dir, target_dir):
+    try:
+        temp_file, relpath = fetch_rss_xml(url, temp_dir)
+    except Exception as e:
+        raise e
+
+    target_file = os.path.join(target_dir, relpath)
+    if os.path.exists(target_file) and is_duplicate_rss_file(temp_file, target_file):
+        return False
+    ensure_file_directory(target_file)
+    shutil.copyfile(temp_file, target_file)
+    logger.warning('%s -> %s', temp_file, target_file)
+    return True
 
 
 def main(args=None):
@@ -82,29 +100,25 @@ def main(args=None):
     with open(config_file, 'r') as fp:
         config_data = json.load(fp)
     feed_urls = config_data['feeds']
+    max_concurrency = int(config_data.get('max-concurrency', 2))
 
-    new_rss_files = []
     err_rss_urls = []
     random.shuffle(feed_urls)
+    update_count = 0
 
-    for u in feed_urls:
-        try:
-            relpath = fetch_rss_xml(u, RSS_FEED_NEW_PATH)
-            new_rss_files.append(relpath)
-        except Exception as e:
-            logger.error('Fetch failed to %s [%s]', relpath, u, exc_info=True)
-            err_rss_urls.append(u)
-        time.sleep(3)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+        results = executor.map(rss_update_worker, feed_urls, [RSS_FEED_NEW_PATH] * len(feed_urls), [RSS_FEED_PATH] * len(feed_urls))
 
-    for f in new_rss_files:
-        target_file = os.path.join(
-                RSS_FEED_PATH, f.removeprefix(RSS_FEED_NEW_PATH).removeprefix('/'))
-        if os.path.exists(target_file) and is_duplicate_rss_file(f, target_file):
-            continue
-        ensure_file_directory(target_file)
-        shutil.copyfile(f, target_file)
+        for r in results:
+            try:
+                update_count += 1 if r else 0
+            except Exception as e:
+                logger.error('Update %s failed [feed: %s]', relpath, u, exc_info=True)
+                err_rss_urls.append(u)
+
     if err_rss_urls:
         logger.warning('Failed to retrieve URLs: %s', pprint.pformat(err_rss_urls))
+    logger.info('Updated %d feeds (Total: %d)', update_count, len(feed_urls))
 
 
 if __name__ == '__main__':
