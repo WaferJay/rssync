@@ -77,7 +77,7 @@ def rss_update_worker(url, temp_dir, target_dir):
     try:
         temp_file, relpath = fetch_rss_xml(url, temp_dir)
     except Exception as e:
-        logger.error('Fetch failed to %s [feed: %s]', relpath, u, exc_info=True)
+        logger.error('Fetch failed: %s', u, exc_info=True)
         return
 
     target_file = os.path.join(target_dir, relpath)
@@ -118,7 +118,7 @@ def main(args=None):
 
     summary = {'last_updated_feeds': update_feeds}
     with open('feeds.json', 'w') as fp:
-        json.dump(summary, fp, separators=(',', ':'))
+        json.dump(summary, fp, indent=2)
     logger.info('Updated %d feeds (Total: %d): %s', len(update_feeds), len(feed_urls), pprint.pformat(summary))
 
 
