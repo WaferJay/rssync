@@ -60,7 +60,6 @@ def fetch_rss_xml(url, basepath='.'):
     ensure_file_directory(target_path)
     with open(target_path, 'wb') as fp:
         fp.write(resp.content)
-    print(target_path, relpath, len(resp.content))
     return target_path, relpath
 
 
@@ -78,15 +77,16 @@ def rss_update_worker(url, temp_dir, target_dir):
     try:
         temp_file, relpath = fetch_rss_xml(url, temp_dir)
     except Exception as e:
-        raise e
+        logger.error('Fetch failed to %s [feed: %s]', relpath, u, exc_info=True)
+        return
 
     target_file = os.path.join(target_dir, relpath)
     if os.path.exists(target_file) and is_duplicate_rss_file(temp_file, target_file):
-        return False
+        return
     ensure_file_directory(target_file)
     shutil.copyfile(temp_file, target_file)
-    logger.warning('%s -> %s', temp_file, target_file)
-    return True
+    logger.info('Update RSS feed %s', temp_file, target_file)
+    return target_file
 
 
 def main(args=None):
@@ -104,21 +104,22 @@ def main(args=None):
 
     err_rss_urls = []
     random.shuffle(feed_urls)
-    update_count = 0
+    update_feeds = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as executor:
         results = executor.map(rss_update_worker, feed_urls, [RSS_FEED_NEW_PATH] * len(feed_urls), [RSS_FEED_PATH] * len(feed_urls))
 
-        for r in results:
-            try:
-                update_count += 1 if r else 0
-            except Exception as e:
-                logger.error('Update %s failed [feed: %s]', relpath, u, exc_info=True)
-                err_rss_urls.append(u)
+        for url, file in zip(feed_urls, results):
+            if file:
+                update_feeds.append({'url': url, 'path': file})
 
     if err_rss_urls:
         logger.warning('Failed to retrieve URLs: %s', pprint.pformat(err_rss_urls))
-    logger.info('Updated %d feeds (Total: %d)', update_count, len(feed_urls))
+
+    summary = {'last_updated_feeds': update_feeds}
+    with open('feeds.json', 'w') as fp:
+        json.dump(summary, fp, separators=(',', ':'))
+    logger.info('Updated %d feeds (Total: %d): %s', len(update_feeds), len(feed_urls), pprint.pformat(summary))
 
 
 if __name__ == '__main__':
