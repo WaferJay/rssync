@@ -219,3 +219,6 @@ __marimo__/
 
 
 .new-feeds/
+
+*.swp
+*.swo

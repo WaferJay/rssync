@@ -116,9 +116,10 @@ def main(args=None):
     if err_rss_urls:
         logger.warning('Failed to retrieve URLs: %s', pprint.pformat(err_rss_urls))
 
-    summary = {'last_updated_feeds': update_feeds}
-    with open('feeds.json', 'w') as fp:
-        json.dump(summary, fp, indent=2)
+    summary = {'last_updated_feeds': update_feeds, 'update_time': int(time.time() * 1000)}
+    if update_feeds or not os.path.exists('feeds.json'):
+        with open('feeds.json', 'w') as fp:
+            json.dump(summary, fp, indent=2)
     logger.info('Updated %d feeds (Total: %d): %s', len(update_feeds), len(feed_urls), pprint.pformat(summary))
 
 
