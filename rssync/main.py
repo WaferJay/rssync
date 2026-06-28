@@ -69,8 +69,8 @@ def is_duplicate_rss_file(rss_file1, rss_file2):
         data1 = fp1.read()
         data2 = fp2.read()
     for p in P_IGNORE_TAGS:
-        data1 = p.sub(data1, b'')
-        data2 = p.sub(data2, b'')
+        data1 = p.sub(b'', data1)
+        data2 = p.sub(b'', data2)
     dup = md5sum(data1) == md5sum(data2)
     return dup
 
