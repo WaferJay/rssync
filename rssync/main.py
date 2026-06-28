@@ -17,6 +17,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -41,8 +42,7 @@ P_IGNORE_TAGS = [
 
 def ensure_file_directory(file):
     d, _ = os.path.split(file)
-    if not os.path.exists(d):
-        os.makedirs(d)
+    os.makedirs(d, exist_ok=True)
 
 
 def md5sum(data: bytes):
@@ -53,6 +53,7 @@ def md5sum(data: bytes):
 def fetch_rss_xml(url, basepath='.'):
     resp = se.get(url)
     resp.raise_for_status()
+    logger.info("Fetched %d bytes from %s", len(resp.content), url)
     parse_result = urlparse(url)
     urlpath = unquote(parse_result.path.removeprefix('/'))
     relpath = os.path.join(parse_result.netloc, urlpath)
@@ -70,14 +71,15 @@ def is_duplicate_rss_file(rss_file1, rss_file2):
     for p in P_IGNORE_TAGS:
         data1 = p.sub(data1, b'')
         data2 = p.sub(data2, b'')
-    return md5sum(data1) == md5sum(data2)
+    dup = md5sum(data1) == md5sum(data2)
+    return dup
 
 
 def rss_update_worker(url, temp_dir, target_dir):
     try:
         temp_file, relpath = fetch_rss_xml(url, temp_dir)
     except Exception as e:
-        logger.error('Fetch failed: %s', u, exc_info=True)
+        logger.error('Fetch failed: %s', url, exc_info=True)
         return
 
     target_file = os.path.join(target_dir, relpath)
@@ -85,7 +87,7 @@ def rss_update_worker(url, temp_dir, target_dir):
         return
     ensure_file_directory(target_file)
     shutil.copyfile(temp_file, target_file)
-    logger.info('Update RSS feed %s', temp_file, target_file)
+    logger.info('Update RSS feed %s -> %s', temp_file, target_file)
     return target_file
 
 
@@ -111,7 +113,10 @@ def main(args=None):
 
         for url, file in zip(feed_urls, results):
             if file:
+                logger.info('Updated %s [feed: %s]', file, url)
                 update_feeds.append({'url': url, 'path': file})
+            else:
+                logger.debug('Skipped %s [feed: %s]', file, url)
 
     if err_rss_urls:
         logger.warning('Failed to retrieve URLs: %s', pprint.pformat(err_rss_urls))
