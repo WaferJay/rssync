@@ -1,8 +1,9 @@
 # rssync
 
-`rssync` downloads RSS 2.0 feeds into `feeds/`. A feed can also archive the raw
-HTML response behind each `<item><link>` and regenerate that RSS link as an
-absolute URL pointing at the local archive.
+`rssync` downloads RSS 2.0 feeds into `feeds/` without rewriting their contents.
+A feed can also archive the raw HTML response behind each `<item><link>`.
+`feeds.json` and `pages.json` expose the relationship between the original RSS
+and archived pages so publication tooling can choose its own URL prefix.
 
 ## Configuration
 
@@ -27,22 +28,53 @@ accepted. Each feed supports:
 - `rss-downloader`: preset used for RSS XML; defaults to `default`.
 - `download-webpages`: whether item webpages are archived; defaults to `false`.
 - `webpage-downloader`: webpage preset; defaults to `default`.
+- `change-detection`: optional per-feed override for RSS comparison rules.
 
-When any feed enables webpage downloads, configure an absolute publication URL:
+Archived webpages are stored under `pages/` by default. The location can be
+changed without configuring a publication host:
 
 ```json
 {
   "webpages": {
-    "public-base-url": "https://archive.example.com/rssync/",
     "storage-path": "pages"
   }
 }
 ```
 
-The generated RSS uses URLs such as
-`https://archive.example.com/rssync/pages/example.com/article--012345abcdef.html`.
-A feed with webpage downloads disabled always keeps its original links, even if
-another feed archives the same page.
+`public-base-url` is not supported. RSS item links always retain their original
+text, including relative links.
+
+## RSS change detection
+
+RSS responses are persisted as their original bytes. By default, changes that
+only affect elements named `lastBuildDate` do not replace the archived RSS:
+
+```json
+{
+  "rss": {
+    "change-detection": {
+      "ignore-tags": ["lastBuildDate"]
+    }
+  }
+}
+```
+
+Tag names are case-sensitive XML local names, so namespace prefixes do not need
+to be configured. A feed can replace the global list; an empty list enables
+strict byte comparison:
+
+```json
+{
+  "url": "https://example.com/rss.xml",
+  "change-detection": {
+    "ignore-tags": []
+  }
+}
+```
+
+Ignored tags only affect change detection. RSS content is never normalized or
+serialized before it is written. If only ignored elements changed, the previous
+original response remains in `feeds/`.
 
 ## Downloader presets
 
@@ -128,12 +160,22 @@ charset conversion, content extraction, HTML rewriting, or linked-asset
 downloads. Relative images, stylesheets, and scripts may therefore not render
 correctly from the archive.
 
-`feeds.json` describes generated RSS files and their resolved downloader
-presets. `pages.json` records archived paths, source and final URLs, response
-headers, SHA-256 hashes, downloader metadata, timestamps, and current status.
+`feeds.json` describes original archived RSS files and their resolved downloader
+presets. `pages.json` records archived paths, canonical source and final URLs,
+response headers, SHA-256 hashes, downloader metadata, timestamps, and current
+status.
 
-If an RSS fetch or parse fails, the previous generated feed is retained. If a
-webpage refresh fails, a valid existing archive remains linked; without a cache,
-the original external target is retained. Relative source links are resolved
-against the final RSS response URL so regenerated links remain absolute.
+Manifest paths are root-relative and never contain a schema or host. RSS paths
+look like `/feeds/example.com/feed.xml`; webpage paths look like
+`/pages/example.com/article--012345abcdef.html`. On disk, these are relative to
+the synchronization root after removing the leading `/`.
+
+A downstream RSS generator can resolve an item link against the corresponding
+`feeds[].final_url`, canonicalize it, find the matching `pages[].source_url`, and
+prepend its own origin or deployment prefix to `pages[].path`. rssync itself does
+not generate that derived RSS.
+
+If an RSS fetch or parse fails, the previous original feed is retained. If a
+webpage refresh fails, a valid existing archive is reported with `cached`
+status; without a cache, it is reported as `failed`. RSS links are unaffected.
 Historical webpage files are not automatically deleted.

@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from rssync.rss import DEFAULT_RSS_IGNORE_TAGS
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 +https://podnews.net/bot PodnewsBot/1.0"
 DEFAULT_REQUESTS_OPTIONS: dict[str, Any] = {
@@ -39,10 +41,25 @@ class ConcurrencyConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class WebpageConfig:
-    """Storage and publication settings for archived webpages."""
+class RssChangeDetectionConfig:
+    """Rules used to decide whether an archived RSS document changed."""
 
-    public_base_url: str | None = None
+    ignore_tags: tuple[str, ...] = DEFAULT_RSS_IGNORE_TAGS
+
+
+@dataclass(frozen=True, slots=True)
+class RssConfig:
+    """Global RSS processing settings."""
+
+    change_detection: RssChangeDetectionConfig = field(
+        default_factory=RssChangeDetectionConfig
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WebpageConfig:
+    """Storage settings for archived webpages."""
+
     storage_path: str = "pages"
 
 
@@ -65,6 +82,9 @@ class FeedConfig:
     rss_downloader: str = "default"
     download_webpages: bool = False
     webpage_downloader: str = "default"
+    change_detection: RssChangeDetectionConfig = field(
+        default_factory=RssChangeDetectionConfig
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +92,7 @@ class AppConfig:
     """Fully validated rssync configuration."""
 
     concurrency: ConcurrencyConfig
+    rss: RssConfig
     webpages: WebpageConfig
     downloaders: Mapping[str, DownloaderPresetConfig]
     feeds: tuple[FeedConfig, ...]
@@ -224,8 +245,55 @@ def _parse_downloaders(data: object) -> Mapping[str, DownloaderPresetConfig]:
     return MappingProxyType(presets)
 
 
+def _parse_change_detection(
+    data: object,
+    location: str,
+    default: RssChangeDetectionConfig,
+) -> RssChangeDetectionConfig:
+    if data is None:
+        return default
+    raw = _mapping(data, location)
+    _only_keys(raw, {"ignore-tags"}, location)
+    if "ignore-tags" not in raw:
+        return default
+
+    ignore_tags = raw["ignore-tags"]
+    if not isinstance(ignore_tags, list):
+        raise ConfigError(f"{location}.ignore-tags must be an array")
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for index, tag in enumerate(ignore_tags):
+        tag_location = f"{location}.ignore-tags[{index}]"
+        if not isinstance(tag, str) or not tag.strip():
+            raise ConfigError(f"{tag_location} must be a non-empty string")
+        if tag != tag.strip():
+            raise ConfigError(f"{tag_location} must not have surrounding whitespace")
+        if tag in seen:
+            raise ConfigError(f"duplicate ignored RSS tag: {tag}")
+        seen.add(tag)
+        parsed.append(tag)
+    return RssChangeDetectionConfig(ignore_tags=tuple(parsed))
+
+
+def _parse_rss(data: object) -> RssConfig:
+    if data is None:
+        return RssConfig()
+    raw = _mapping(data, "rss")
+    _only_keys(raw, {"change-detection"}, "rss")
+    return RssConfig(
+        change_detection=_parse_change_detection(
+            raw.get("change-detection"),
+            "rss.change-detection",
+            RssChangeDetectionConfig(),
+        )
+    )
+
+
 def _parse_feeds(
-    data: object, downloaders: Mapping[str, DownloaderPresetConfig]
+    data: object,
+    downloaders: Mapping[str, DownloaderPresetConfig],
+    default_change_detection: RssChangeDetectionConfig,
 ) -> tuple[FeedConfig, ...]:
     if not isinstance(data, list) or not data:
         raise ConfigError("feeds must be a non-empty array of objects")
@@ -242,6 +310,7 @@ def _parse_feeds(
                 "rss-downloader",
                 "download-webpages",
                 "webpage-downloader",
+                "change-detection",
             },
             location,
         )
@@ -273,34 +342,21 @@ def _parse_feeds(
                 rss_downloader=rss_downloader,
                 download_webpages=download_webpages,
                 webpage_downloader=webpage_downloader,
+                change_detection=_parse_change_detection(
+                    raw.get("change-detection"),
+                    f"{location}.change-detection",
+                    default_change_detection,
+                ),
             )
         )
     return tuple(feeds)
 
 
-def _parse_webpages(data: object, required: bool) -> WebpageConfig:
+def _parse_webpages(data: object) -> WebpageConfig:
     if data is None:
-        if required:
-            raise ConfigError(
-                "webpages.public-base-url is required when webpage downloads "
-                "are enabled"
-            )
         return WebpageConfig()
     raw = _mapping(data, "webpages")
-    _only_keys(raw, {"public-base-url", "storage-path"}, "webpages")
-    public_base_url = raw.get("public-base-url")
-    if public_base_url is not None:
-        public_base_url = _http_url(public_base_url, "webpages.public-base-url")
-        parsed_base_url = urlsplit(public_base_url)
-        if parsed_base_url.query or parsed_base_url.fragment:
-            raise ConfigError(
-                "webpages.public-base-url must not contain a query or fragment"
-            )
-        public_base_url = public_base_url.rstrip("/") + "/"
-    elif required:
-        raise ConfigError(
-            "webpages.public-base-url is required when webpage downloads are enabled"
-        )
+    _only_keys(raw, {"storage-path"}, "webpages")
 
     storage_path = raw.get("storage-path", "pages")
     if not isinstance(storage_path, str) or not storage_path:
@@ -308,22 +364,25 @@ def _parse_webpages(data: object, required: bool) -> WebpageConfig:
     path = PurePath(storage_path)
     if path.is_absolute() or ".." in path.parts:
         raise ConfigError("webpages.storage-path must be a safe relative path")
-    return WebpageConfig(public_base_url=public_base_url, storage_path=storage_path)
+    return WebpageConfig(storage_path=storage_path)
 
 
 def parse_config(data: object) -> AppConfig:
     """Parse a JSON-compatible value into a validated configuration."""
 
     raw = _mapping(data, "configuration")
-    _only_keys(raw, {"concurrency", "webpages", "downloaders", "feeds"}, "top-level")
-    downloaders = _parse_downloaders(raw.get("downloaders"))
-    feeds = _parse_feeds(raw.get("feeds"), downloaders)
-    webpages = _parse_webpages(
-        raw.get("webpages"), any(feed.download_webpages for feed in feeds)
+    _only_keys(
+        raw,
+        {"concurrency", "rss", "webpages", "downloaders", "feeds"},
+        "top-level",
     )
+    downloaders = _parse_downloaders(raw.get("downloaders"))
+    rss = _parse_rss(raw.get("rss"))
+    feeds = _parse_feeds(raw.get("feeds"), downloaders, rss.change_detection)
     return AppConfig(
         concurrency=_parse_concurrency(raw.get("concurrency")),
-        webpages=webpages,
+        rss=rss,
+        webpages=_parse_webpages(raw.get("webpages")),
         downloaders=downloaders,
         feeds=feeds,
     )

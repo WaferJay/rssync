@@ -9,7 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import Path, PurePath
+from pathlib import Path
 from typing import Any, TypeVar
 
 from rssync.config import AppConfig, FeedConfig
@@ -22,9 +22,10 @@ from rssync.downloaders.registry import DownloaderManager, DownloaderRegistry
 from rssync.manifests import load_feed_records, load_page_records
 from rssync.rss import RssDocument
 from rssync.storage import (
-    public_webpage_url,
+    manifest_path_relpath,
     rss_feed_local_url,
     rss_feed_relpath,
+    webpage_manifest_path,
     webpage_relpath,
     write_json_atomic,
     write_rss_if_changed,
@@ -208,33 +209,27 @@ class SyncEngine:
     def _valid_page_cache(self, record: Mapping[str, Any] | None) -> bool:
         if not record or not isinstance(record.get("path"), str):
             return False
-        path = PurePath(record["path"])
-        if path.is_absolute() or ".." in path.parts:
+        path = manifest_path_relpath(record["path"])
+        if path is None:
             return False
-        return (self.root / path).is_file()
+        return self.root.joinpath(*path.parts).is_file()
 
     def _update_pages(
         self,
         tasks: Mapping[str, PageTask],
         outcomes: Mapping[str, PageOutcome],
-    ) -> tuple[dict[str, str], dict[str, dict[str, Any]], list[str]]:
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
         manifest_path = self.root / WEBPAGE_MANIFEST_PATH
         previous = load_page_records(manifest_path)
         records = dict(previous)
-        replacements: dict[str, str] = {}
         changed_paths: list[str] = []
-        public_base_url = self.config.webpages.public_base_url
-        if tasks and public_base_url is None:
-            raise AssertionError("validated webpage configuration has no public URL")
 
         for canonical_url, task in tasks.items():
             outcome = outcomes[canonical_url]
             prior = previous.get(canonical_url)
             if outcome.download is not None:
                 downloaded = outcome.download
-                path = Path(self.config.webpages.storage_path, task.relpath).as_posix()
-                local_url = public_webpage_url(
-                    public_base_url or "",
+                path = webpage_manifest_path(
                     self.config.webpages.storage_path,
                     task.relpath,
                 )
@@ -248,7 +243,6 @@ class SyncEngine:
                     "source_url": canonical_url,
                     "final_url": downloaded.final_url,
                     "path": path,
-                    "local_url": local_url,
                     "content_type": downloaded.content_type,
                     "sha256": downloaded.sha256,
                     "bytes": downloaded.byte_count,
@@ -267,23 +261,18 @@ class SyncEngine:
                     "status": "ok",
                 }
                 records[canonical_url] = record
-                replacements[canonical_url] = local_url
                 if downloaded.changed:
                     changed_paths.append(path)
             elif self._valid_page_cache(prior):
                 record = dict(prior or {})
-                path = record["path"]
-                local_url = public_webpage_url(public_base_url or "", "", path)
                 record.update(
                     {
-                        "local_url": local_url,
                         "changed": False,
                         "status": "cached",
                         "last_error": str(outcome.error),
                     }
                 )
                 records[canonical_url] = record
-                replacements[canonical_url] = local_url
             else:
                 records[canonical_url] = {
                     "source_url": canonical_url,
@@ -294,12 +283,11 @@ class SyncEngine:
                     "status": "failed",
                     "last_error": str(outcome.error),
                 }
-        return replacements, records, changed_paths
+        return records, changed_paths
 
     def _feed_record(
         self,
         outcome: FeedOutcome,
-        replacements: Mapping[str, str],
         previous: Mapping[str, Any],
     ) -> tuple[dict[str, Any] | None, str | None]:
         feed = outcome.feed
@@ -320,11 +308,11 @@ class SyncEngine:
             )
             return record, None
 
-        rendered = outcome.document.render(
-            replacements if feed.download_webpages else {},
-            absolute_fallback=feed.download_webpages,
+        changed = write_rss_if_changed(
+            target,
+            outcome.document.source,
+            feed.change_detection.ignore_tags,
         )
-        changed = write_rss_if_changed(target, rendered)
         downloaded = outcome.download
         updated_at = downloaded.fetched_at if changed else previous.get("updated_at")
         record = {
@@ -336,6 +324,9 @@ class SyncEngine:
             "webpage_downloader": feed.webpage_downloader,
             "webpage_backend": self.manager.backend_name(feed.webpage_downloader),
             "download_webpages": feed.download_webpages,
+            "change_detection": {
+                "ignore_tags": list(feed.change_detection.ignore_tags)
+            },
             "use_session": downloaded.metadata.get("use_session"),
             "user_agent": downloaded.metadata.get("user_agent"),
             "user_agent_strategy": downloaded.metadata.get("user_agent_strategy"),
@@ -353,9 +344,7 @@ class SyncEngine:
             feed_outcomes = self._fetch_feeds()
             page_tasks = self._select_page_tasks(feed_outcomes)
             page_outcomes = self._fetch_pages(page_tasks)
-            replacements, page_records, changed_pages = self._update_pages(
-                page_tasks, page_outcomes
-            )
+            page_records, changed_pages = self._update_pages(page_tasks, page_outcomes)
 
             previous_feeds = load_feed_records(self.root / RSS_FEED_MANIFEST_PATH)
             feed_records: list[dict[str, Any]] = []
@@ -363,7 +352,6 @@ class SyncEngine:
             for index, feed in enumerate(self.config.feeds):
                 record, changed_path = self._feed_record(
                     feed_outcomes[index],
-                    replacements,
                     previous_feeds.get(feed.url, {}),
                 )
                 if record is not None:

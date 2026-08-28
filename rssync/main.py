@@ -18,7 +18,6 @@ from rssync.manifests import (
     load_feed_updated_at,
 )
 from rssync.storage import (
-    P_IGNORE_TAGS,
     ensure_file_directory,
     is_duplicate_rss_file,
     md5sum,
@@ -100,7 +99,6 @@ def main(args: list[str] | None = None) -> None:
 
 
 __all__ = [
-    "P_IGNORE_TAGS",
     "RSS_FEED_MANIFEST_PATH",
     "RSS_FEED_NEW_PATH",
     "RSS_FEED_PATH",

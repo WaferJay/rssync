@@ -1,6 +1,6 @@
+import json
 import tempfile
 import unittest
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from rssync.config import parse_config
@@ -45,7 +45,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(factory.calls, [("rss", feed_url, "default")])
             self.assertFalse(Path(directory, "pages.json").exists())
 
-    def test_enabled_webpage_is_stored_raw_and_linked_absolutely(self):
+    def test_enabled_webpage_and_rss_are_both_stored_raw(self):
         feed_url = "https://example.com/news/feed.xml"
         page_url = "https://example.com/article?id=1"
         page_body = b"\xff<html><body>raw bytes</body></html>"
@@ -64,10 +64,6 @@ class SyncEngineTest(unittest.TestCase):
         )
         config = parse_config(
             {
-                "webpages": {
-                    "public-base-url": "https://archive.example/rssync/",
-                    "storage-path": "pages",
-                },
                 "downloaders": {"default": {"backend": "fake"}},
                 "feeds": [{"url": feed_url, "download-webpages": True}],
             }
@@ -82,17 +78,16 @@ class SyncEngineTest(unittest.TestCase):
             ).run()
 
             page_record = manifests["pages"]["pages"][0]
-            archived = Path(directory, page_record["path"])
+            archived = Path(directory, page_record["path"].removeprefix("/"))
             self.assertEqual(archived.read_bytes(), page_body)
-            self.assertTrue(
-                page_record["local_url"].startswith(
-                    "https://archive.example/rssync/pages/"
-                )
-            )
-            generated = ET.parse(Path(directory, "feeds/example.com/news/feed.xml"))
+            self.assertTrue(page_record["path"].startswith("/pages/"))
+            self.assertNotIn("local_url", page_record)
             self.assertEqual(
-                generated.findtext("./channel/item/link"),
-                page_record["local_url"],
+                Path(directory, "feeds/example.com/news/feed.xml").read_bytes(),
+                feed_body,
+            )
+            self.assertEqual(
+                manifests["pages"]["sync"]["changed"], [page_record["path"]]
             )
             self.assertEqual(
                 factory.calls,
@@ -120,7 +115,6 @@ class SyncEngineTest(unittest.TestCase):
         )
         config = parse_config(
             {
-                "webpages": {"public-base-url": "https://archive.example/"},
                 "downloaders": {
                     "default": {"backend": "fake"},
                     "first": {
@@ -212,7 +206,6 @@ class SyncEngineTest(unittest.TestCase):
         )
         config = parse_config(
             {
-                "webpages": {"public-base-url": "https://archive.example/"},
                 "downloaders": {"default": {"backend": "fake"}},
                 "feeds": [{"url": feed_url, "download-webpages": True}],
             }
@@ -230,7 +223,16 @@ class SyncEngineTest(unittest.TestCase):
                 root=directory,
                 registry=registry_with(first_factory),
             ).run()
-            local_url = first["pages"]["pages"][0]["local_url"]
+            page_record = first["pages"]["pages"][0]
+            page_path = page_record["path"]
+            legacy_manifest = first["pages"]
+            legacy_manifest["pages"][0]["path"] = page_path.removeprefix("/")
+            legacy_manifest["pages"][0]["local_url"] = (
+                f"https://archive.example{page_path}"
+            )
+            Path(directory, "pages.json").write_text(
+                json.dumps(legacy_manifest), encoding="utf-8"
+            )
 
             second_factory = FakeBackendFactory(
                 {
@@ -244,11 +246,15 @@ class SyncEngineTest(unittest.TestCase):
                 registry=registry_with(second_factory),
             ).run()
 
-            generated = ET.parse(Path(directory, "feeds/example.com/feed.xml"))
-            self.assertEqual(generated.findtext("./channel/item/link"), local_url)
-            self.assertEqual(second["pages"]["pages"][0]["status"], "cached")
+            migrated = second["pages"]["pages"][0]
+            self.assertEqual(migrated["status"], "cached")
+            self.assertEqual(migrated["path"], page_path)
+            self.assertNotIn("local_url", migrated)
+            self.assertEqual(
+                Path(directory, "feeds/example.com/feed.xml").read_bytes(), rss
+            )
 
-    def test_failed_relative_webpage_falls_back_to_absolute_external_url(self):
+    def test_failed_relative_webpage_does_not_modify_rss(self):
         feed_url = "https://example.com/news/feed.xml"
         page_url = "https://example.com/article"
         rss = (
@@ -264,9 +270,77 @@ class SyncEngineTest(unittest.TestCase):
         )
         config = parse_config(
             {
-                "webpages": {"public-base-url": "https://archive.example/"},
                 "downloaders": {"default": {"backend": "fake"}},
                 "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifests = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+            archived_rss = Path(directory, "feeds/example.com/news/feed.xml")
+
+            self.assertEqual(archived_rss.read_bytes(), rss)
+            self.assertEqual(manifests["pages"]["pages"][0]["status"], "failed")
+
+    def test_default_change_detection_ignores_last_build_date(self):
+        feed_url = "https://example.com/feed.xml"
+        first_body = (
+            b'<rss version="2.0"><channel><lastBuildDate>one</lastBuildDate>'
+            b"<title>Feed</title></channel></rss>"
+        )
+        second_body = first_body.replace(b">one<", b">two<")
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(first_body)})
+                ),
+                clock=lambda: 100,
+            ).run()
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(second_body)})
+                ),
+                clock=lambda: 200,
+            ).run()
+
+            output = Path(directory, "feeds/example.com/feed.xml")
+            self.assertEqual(output.read_bytes(), first_body)
+            self.assertTrue(first["feeds"]["feeds"][0]["changed"])
+            self.assertFalse(second["feeds"]["feeds"][0]["changed"])
+            self.assertEqual(second["feeds"]["feeds"][0]["updated_at"], 100)
+            self.assertEqual(second["feeds"]["feeds"][0]["fetched_at"], 200)
+
+    def test_feed_override_can_enable_exact_byte_detection(self):
+        feed_url = "https://example.com/feed.xml"
+        first_body = (
+            b'<rss version="2.0"><channel><lastBuildDate>one</lastBuildDate>'
+            b"</channel></rss>"
+        )
+        second_body = first_body.replace(b">one<", b">two<")
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [
+                    {
+                        "url": feed_url,
+                        "change-detection": {"ignore-tags": []},
+                    }
+                ],
             }
         )
 
@@ -274,11 +348,27 @@ class SyncEngineTest(unittest.TestCase):
             SyncEngine(
                 config,
                 root=directory,
-                registry=registry_with(factory),
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(first_body)})
+                ),
+                clock=lambda: 100,
             ).run()
-            generated = ET.parse(Path(directory, "feeds/example.com/news/feed.xml"))
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(second_body)})
+                ),
+                clock=lambda: 200,
+            ).run()
 
-        self.assertEqual(generated.findtext("./channel/item/link"), page_url)
+            output = Path(directory, "feeds/example.com/feed.xml")
+            self.assertEqual(output.read_bytes(), second_body)
+            self.assertTrue(second["feeds"]["feeds"][0]["changed"])
+            self.assertEqual(
+                second["feeds"]["feeds"][0]["change_detection"],
+                {"ignore_tags": []},
+            )
 
 
 if __name__ == "__main__":

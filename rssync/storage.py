@@ -7,13 +7,12 @@ import json
 import os
 import re
 import tempfile
-from pathlib import Path
+from collections.abc import Collection
+from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
-P_IGNORE_TAGS = [
-    re.compile(b"<lastBuildDate>.*?</lastBuildDate>", re.IGNORECASE | re.DOTALL)
-]
+from rssync.rss import DEFAULT_RSS_IGNORE_TAGS, rss_documents_equal
 
 
 def ensure_file_directory(file: str | os.PathLike[str]) -> None:
@@ -52,10 +51,9 @@ def rss_feed_relpath(url: str) -> str:
 
 
 def rss_feed_local_url(relpath: str) -> str:
-    """Return the root-relative public URL of a local RSS file."""
+    """Return the root-relative manifest path of a local RSS file."""
 
-    url_path = relpath.replace(os.sep, "/").lstrip("/")
-    return f"/feeds/{url_path}"
+    return root_relative_manifest_path("feeds", relpath.replace(os.sep, "/"))
 
 
 def unique_feed_urls(feed_urls: list[str]) -> list[str]:
@@ -86,12 +84,29 @@ def webpage_relpath(canonical_url: str) -> str:
     return Path(host, *directory_parts, f"{leaf}--{digest}.html").as_posix()
 
 
-def public_webpage_url(public_base_url: str, storage_path: str, relpath: str) -> str:
-    """Join the configured absolute base URL with one archived page path."""
+def root_relative_manifest_path(*parts: str) -> str:
+    """Join safe path components as a root-relative POSIX manifest path."""
 
-    path = Path(storage_path, relpath).as_posix()
-    encoded = "/".join(quote(part) for part in path.split("/"))
-    return f"{public_base_url.rstrip('/')}/{encoded}"
+    path = PurePosixPath(*parts)
+    return f"/{path.as_posix().lstrip('/')}"
+
+
+def manifest_path_relpath(path: str) -> PurePosixPath | None:
+    """Validate a current or legacy manifest path and return its disk path."""
+
+    if not path or path.startswith("//"):
+        return None
+    value = path.removeprefix("/")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return relative
+
+
+def webpage_manifest_path(storage_path: str, relpath: str) -> str:
+    """Return the root-relative manifest path of an archived webpage."""
+
+    return root_relative_manifest_path(storage_path, relpath)
 
 
 def temporary_sibling(target: str | os.PathLike[str]) -> Path:
@@ -123,26 +138,29 @@ def commit_download(
 
 
 def is_duplicate_rss_file(
-    rss_file1: str | os.PathLike[str], rss_file2: str | os.PathLike[str]
+    rss_file1: str | os.PathLike[str],
+    rss_file2: str | os.PathLike[str],
+    ignore_tags: Collection[str] = DEFAULT_RSS_IGNORE_TAGS,
 ) -> bool:
-    """Compare RSS files while ignoring volatile ``lastBuildDate`` values."""
+    """Compare RSS files while omitting configured XML elements."""
 
     data1 = Path(rss_file1).read_bytes()
     data2 = Path(rss_file2).read_bytes()
-    for pattern in P_IGNORE_TAGS:
-        data1 = pattern.sub(b"", data1)
-        data2 = pattern.sub(b"", data2)
-    return md5sum(data1) == md5sum(data2)
+    return rss_documents_equal(data1, data2, ignore_tags)
 
 
-def write_rss_if_changed(path: str | os.PathLike[str], data: bytes) -> bool:
-    """Atomically write generated RSS unless meaningful content is unchanged."""
+def write_rss_if_changed(
+    path: str | os.PathLike[str],
+    data: bytes,
+    ignore_tags: Collection[str] = DEFAULT_RSS_IGNORE_TAGS,
+) -> bool:
+    """Atomically write original RSS unless meaningful content is unchanged."""
 
     target = Path(path)
     temporary = temporary_sibling(target)
     try:
         temporary.write_bytes(data)
-        if target.is_file() and is_duplicate_rss_file(temporary, target):
+        if target.is_file() and is_duplicate_rss_file(temporary, target, ignore_tags):
             temporary.unlink(missing_ok=True)
             return False
         os.replace(temporary, target)

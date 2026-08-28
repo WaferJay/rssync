@@ -3,8 +3,14 @@
         "rss-downloads": 2,
         "webpage-downloads": 8
     },
+    "rss": {
+        "change-detection": {
+            "ignore-tags": [
+                "lastBuildDate"
+            ]
+        }
+    },
     "webpages": {
-        "public-base-url": "https://archive.example.com/rssync/",
         "storage-path": "pages"
     },
     "downloaders": {
@@ -46,7 +52,10 @@
             "url": "https://example.net/rss.xml",
             "rss-downloader": "default",
             "download-webpages": true,
-            "webpage-downloader": "rotating"
+            "webpage-downloader": "rotating",
+            "change-detection": {
+                "ignore-tags": []
+            }
         }
     ]
 }

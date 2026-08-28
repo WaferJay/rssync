@@ -8,7 +8,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from rssync.storage import rss_feed_local_url, rss_feed_relpath
+from rssync.storage import (
+    manifest_path_relpath,
+    root_relative_manifest_path,
+    rss_feed_local_url,
+    rss_feed_relpath,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +48,29 @@ def load_feed_records(path: str | Path = "feeds.json") -> dict[str, dict[str, An
 
 
 def load_page_records(path: str | Path = "pages.json") -> dict[str, dict[str, Any]]:
-    """Load complete webpage records indexed by canonical source URL."""
+    """Load and migrate webpage records indexed by canonical source URL."""
 
     manifest = _read_manifest(path, "webpage")
     records = manifest.get("pages", [])
     if not isinstance(records, list):
         return {}
-    return {
-        record["source_url"]: dict(record)
-        for record in records
-        if isinstance(record, dict) and isinstance(record.get("source_url"), str)
-    }
+    migrated: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(
+            record.get("source_url"), str
+        ):
+            continue
+        normalized = dict(record)
+        normalized.pop("local_url", None)
+        path_value = normalized.get("path")
+        if isinstance(path_value, str):
+            relative = manifest_path_relpath(path_value)
+            if relative is None:
+                normalized.pop("path", None)
+            else:
+                normalized["path"] = root_relative_manifest_path(relative.as_posix())
+        migrated[normalized["source_url"]] = normalized
+    return migrated
 
 
 def load_feed_metadata(

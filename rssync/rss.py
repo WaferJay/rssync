@@ -1,12 +1,15 @@
-"""RSS 2.0 parsing, link normalization, and rendering."""
+"""RSS 2.0 validation, link normalization, and change detection."""
 
 from __future__ import annotations
 
 import ipaddress
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
+from collections.abc import Collection
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
+
+DEFAULT_RSS_IGNORE_TAGS = ("lastBuildDate",)
 
 
 class RssParseError(ValueError):
@@ -43,22 +46,76 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-@dataclass(slots=True)
-class RssLink:
-    """A mutable RSS item link and its normalized download identity."""
+def _append_text(parts: list[tuple[str, Any]], value: str | None) -> None:
+    """Append meaningful mixed-content text to an XML comparison key."""
 
-    element: ET.Element
+    if value is None or not value.strip():
+        return
+    if parts and parts[-1][0] == "text":
+        parts[-1] = ("text", parts[-1][1] + value)
+    else:
+        parts.append(("text", value))
+
+
+def _element_comparison_key(
+    element: ET.Element,
+    ignored: frozenset[str],
+) -> tuple[Any, ...] | None:
+    """Return a namespace-aware structural key without ignored elements."""
+
+    if _local_name(element.tag) in ignored:
+        return None
+
+    content: list[tuple[str, Any]] = []
+    _append_text(content, element.text)
+    for child in element:
+        child_key = _element_comparison_key(child, ignored)
+        if child_key is not None:
+            content.append(("element", child_key))
+        _append_text(content, child.tail)
+    return (
+        element.tag,
+        tuple(sorted(element.attrib.items())),
+        tuple(content),
+    )
+
+
+def rss_documents_equal(
+    first: bytes,
+    second: bytes,
+    ignore_tags: Collection[str] = (),
+) -> bool:
+    """Compare RSS bytes, omitting configured XML elements when requested."""
+
+    if first == second:
+        return True
+    ignored = frozenset(ignore_tags)
+    if not ignored:
+        return False
+    try:
+        first_root = ET.fromstring(first)
+        second_root = ET.fromstring(second)
+    except ET.ParseError:
+        return False
+    return _element_comparison_key(first_root, ignored) == _element_comparison_key(
+        second_root, ignored
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RssLink:
+    """An RSS item link and its normalized download identity."""
+
     original: str
     resolved_url: str
     canonical_url: str
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class RssDocument:
-    """A parsed RSS document retaining its original source bytes."""
+    """A validated RSS document retaining its exact source bytes."""
 
     source: bytes
-    root: ET.Element
     links: tuple[RssLink, ...]
 
     @classmethod
@@ -88,30 +145,9 @@ class RssDocument:
                     continue
                 links.append(
                     RssLink(
-                        element=child,
                         original=original,
                         resolved_url=resolved,
                         canonical_url=canonical,
                     )
                 )
-        return cls(source=source, root=root, links=tuple(links))
-
-    def render(
-        self,
-        replacements: Mapping[str, str],
-        *,
-        absolute_fallback: bool = False,
-    ) -> bytes:
-        """Render selected local links and optionally absolutize fallbacks."""
-
-        changed = False
-        for link in self.links:
-            replacement = replacements.get(link.canonical_url)
-            if replacement is None and absolute_fallback:
-                replacement = link.resolved_url
-            if replacement is not None and link.element.text != replacement:
-                link.element.text = replacement
-                changed = True
-        if not changed:
-            return self.source
-        return ET.tostring(self.root, encoding="utf-8", xml_declaration=True)
+        return cls(source=source, links=tuple(links))
