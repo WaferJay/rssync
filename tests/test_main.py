@@ -100,7 +100,9 @@ class FeedManifestTest(unittest.TestCase):
             manifest_path = os.path.join(directory, 'feeds.json')
             with open(manifest_path, 'w', encoding='utf-8') as fp:
                 json.dump({
-                    'last_updated_feeds': [{'url': feed_a, 'path': 'feeds/example.com/rss.xml'}],
+                    'last_updated_feeds': [
+                        {'url': feed_a, 'path': 'feeds/example.com/rss.xml'}
+                    ],
                     'update_time': 200000,
                 }, fp)
 

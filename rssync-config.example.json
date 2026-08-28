@@ -1,5 +1,52 @@
 {
+    "concurrency": {
+        "rss-downloads": 2,
+        "webpage-downloads": 8
+    },
+    "webpages": {
+        "public-base-url": "https://archive.example.com/rssync/",
+        "storage-path": "pages"
+    },
+    "downloaders": {
+        "default": {
+            "options": {
+                "use-session": true,
+                "timeout": 30,
+                "retries": 3,
+                "backoff-factor": 0.5,
+                "verify-tls": true,
+                "user-agent": {
+                    "strategy": "per-run"
+                }
+            }
+        },
+        "rotating": {
+            "backend": "requests",
+            "concurrency": {
+                "rss-downloads": 1,
+                "webpage-downloads": 2
+            },
+            "options": {
+                "use-session": false,
+                "user-agent": {
+                    "strategy": "per-request"
+                }
+            }
+        }
+    },
     "feeds": [
-        "https://example.com/rss.xml"
+        {
+            "url": "https://example.com/rss.xml"
+        },
+        {
+            "url": "https://example.org/rss.xml",
+            "download-webpages": true
+        },
+        {
+            "url": "https://example.net/rss.xml",
+            "rss-downloader": "default",
+            "download-webpages": true,
+            "webpage-downloader": "rotating"
+        }
     ]
 }
