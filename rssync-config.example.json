@@ -12,7 +12,8 @@
         }
     },
     "webpages": {
-        "storage-path": "pages"
+        "storage-path": "pages",
+        "refresh-policy": "always"
     },
     "downloaders": {
         "default": {
@@ -47,13 +48,15 @@
         },
         {
             "url": "https://example.org/rss.xml",
-            "download-webpages": true
+            "download-webpages": true,
+            "webpage-refresh-policy": "on-rss-change"
         },
         {
             "url": "https://example.net/rss.xml",
             "rss-downloader": "default",
             "download-webpages": true,
             "webpage-downloader": "rotating",
+            "webpage-refresh-policy": "missing-only",
             "change-detection": {
                 "ignore-tags": []
             }

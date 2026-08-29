@@ -6,6 +6,7 @@ from pathlib import Path
 from rssync.config import parse_config
 from rssync.downloaders.registry import DownloaderRegistry
 from rssync.sync import SyncEngine
+from rssync.webpage_refresh import default_webpage_refresh_registry
 from tests.fakes import FakeBackendFactory, FakeReply
 
 
@@ -20,6 +21,13 @@ def rss_with_links(*urls: str) -> bytes:
         b"<item><link>" + url.encode() + b"</link></item>" for url in urls
     )
     return b'<rss version="2.0"><channel>' + items + b"</channel></rss>"
+
+
+class NeverRefreshStrategy:
+    name = "never"
+
+    def should_fetch(self, context):
+        return False
 
 
 class SyncEngineTest(unittest.TestCase):
@@ -103,6 +111,314 @@ class SyncEngineTest(unittest.TestCase):
                     ("webpage", page_url, "default"),
                 ],
             )
+
+    def test_on_rss_change_skips_when_only_ignored_tags_change(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        first_rss = (
+            b'<rss version="2.0"><channel><lastBuildDate>one</lastBuildDate>'
+            b"<item><link>"
+            + page_url.encode()
+            + b"</link></item></channel></rss>"
+        )
+        second_rss = first_rss.replace(b">one<", b">two<")
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "on-rss-change"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(first_rss),
+                            page_url: FakeReply(b"<html>original</html>", "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+            page_path = Path(
+                directory,
+                first["pages"]["pages"][0]["path"].removeprefix("/"),
+            )
+            second_factory = FakeBackendFactory({feed_url: FakeReply(second_rss)})
+
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+                clock=lambda: 200,
+            ).run()
+
+            page_record = second["pages"]["pages"][0]
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            self.assertEqual(page_path.read_bytes(), b"<html>original</html>")
+            self.assertEqual(page_record["status"], "skipped")
+            self.assertEqual(page_record["skip_reason"], "on-rss-change")
+            self.assertEqual(page_record["updated_at"], 100)
+            self.assertEqual(page_record["fetched_at"], 100)
+            self.assertFalse(page_record["changed"])
+            self.assertEqual(second["pages"]["sync"]["changed"], [])
+            self.assertEqual(
+                second["feeds"]["feeds"][0]["webpage_refresh_policy"],
+                "on-rss-change",
+            )
+
+    def test_on_rss_change_refreshes_after_a_meaningful_change(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        first_rss = rss_with_links(page_url)
+        second_rss = first_rss.replace(b"<channel>", b"<channel><title>new</title>")
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "on-rss-change"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(first_rss),
+                            page_url: FakeReply(b"<html>old</html>", "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+            second_factory = FakeBackendFactory(
+                {
+                    feed_url: FakeReply(second_rss),
+                    page_url: FakeReply(b"<html>new</html>", "text/html"),
+                }
+            )
+
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+                clock=lambda: 200,
+            ).run()
+
+            page_record = second["pages"]["pages"][0]
+            self.assertIn(("webpage", page_url, "default"), second_factory.calls)
+            self.assertEqual(page_record["status"], "ok")
+            self.assertEqual(page_record["updated_at"], 200)
+            self.assertEqual(page_record["fetched_at"], 200)
+
+    def test_missing_only_preserves_cache_and_repairs_invalid_cache(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        first_rss = rss_with_links(page_url)
+        changed_rss = first_rss.replace(b"<channel>", b"<channel><title>new</title>")
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "missing-only"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(first_rss),
+                            page_url: FakeReply(b"<html>original</html>", "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+            page_path = Path(
+                directory,
+                first["pages"]["pages"][0]["path"].removeprefix("/"),
+            )
+            second_factory = FakeBackendFactory({feed_url: FakeReply(changed_rss)})
+
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+                clock=lambda: 200,
+            ).run()
+
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            self.assertEqual(page_path.read_bytes(), b"<html>original</html>")
+            self.assertEqual(second["pages"]["pages"][0]["status"], "skipped")
+            page_path.unlink()
+            repair_factory = FakeBackendFactory(
+                {
+                    feed_url: FakeReply(changed_rss),
+                    page_url: FakeReply(b"<html>repaired</html>", "text/html"),
+                }
+            )
+
+            repaired = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(repair_factory),
+                clock=lambda: 300,
+            ).run()
+
+            self.assertIn(("webpage", page_url, "default"), repair_factory.calls)
+            self.assertEqual(page_path.read_bytes(), b"<html>repaired</html>")
+            self.assertEqual(repaired["pages"]["pages"][0]["status"], "ok")
+            self.assertEqual(repaired["pages"]["pages"][0]["fetched_at"], 300)
+
+            unsafe_manifest = repaired["pages"]
+            unsafe_manifest["pages"][0]["path"] = "/../outside.html"
+            Path(directory, "pages.json").write_text(
+                json.dumps(unsafe_manifest),
+                encoding="utf-8",
+            )
+            reindex_factory = FakeBackendFactory(
+                {
+                    feed_url: FakeReply(changed_rss),
+                    page_url: FakeReply(b"<html>reindexed</html>", "text/html"),
+                }
+            )
+
+            reindexed = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(reindex_factory),
+                clock=lambda: 400,
+            ).run()
+
+            self.assertIn(("webpage", page_url, "default"), reindex_factory.calls)
+            self.assertEqual(page_path.read_bytes(), b"<html>reindexed</html>")
+            self.assertEqual(reindexed["pages"]["pages"][0]["status"], "ok")
+            self.assertEqual(reindexed["pages"]["pages"][0]["fetched_at"], 400)
+
+    def test_shared_page_uses_first_feed_whose_policy_requests_refresh(self):
+        first_feed = "https://one.example/feed.xml"
+        second_feed = "https://two.example/feed.xml"
+        page_url = "https://shared.example/article"
+        first_rss = rss_with_links(page_url)
+        second_rss = rss_with_links(page_url)
+        changed_second_rss = second_rss.replace(
+            b"<channel>",
+            b"<channel><title>changed</title>",
+        )
+        config = parse_config(
+            {
+                "downloaders": {
+                    "default": {"backend": "fake"},
+                    "first": {"backend": "fake", "options": {"label": "first"}},
+                    "second": {
+                        "backend": "fake",
+                        "options": {"label": "second"},
+                    },
+                },
+                "feeds": [
+                    {
+                        "url": first_feed,
+                        "download-webpages": True,
+                        "webpage-downloader": "first",
+                        "webpage-refresh-policy": "missing-only",
+                    },
+                    {
+                        "url": second_feed,
+                        "download-webpages": True,
+                        "webpage-downloader": "second",
+                        "webpage-refresh-policy": "on-rss-change",
+                    },
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            first_feed: FakeReply(first_rss),
+                            second_feed: FakeReply(second_rss),
+                            page_url: FakeReply(b"<html>first</html>", "text/html"),
+                        }
+                    )
+                ),
+            ).run()
+            second_factory = FakeBackendFactory(
+                {
+                    first_feed: FakeReply(first_rss),
+                    second_feed: FakeReply(changed_second_rss),
+                    page_url: FakeReply(b"<html>second</html>", "text/html"),
+                }
+            )
+
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+            ).run()
+
+            page_calls = [call for call in second_factory.calls if call[0] == "webpage"]
+            self.assertEqual(page_calls, [("webpage", page_url, "second")])
+            self.assertEqual(
+                second["pages"]["pages"][0]["first_feed_url"],
+                second_feed,
+            )
+
+    def test_custom_refresh_strategy_is_used_without_engine_changes(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        rss = rss_with_links(page_url)
+        refresh_registry = default_webpage_refresh_registry()
+        refresh_registry.register(NeverRefreshStrategy())
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "never"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            },
+            refresh_registry=refresh_registry,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(rss),
+                            page_url: FakeReply(b"<html>cached</html>", "text/html"),
+                        }
+                    )
+                ),
+                refresh_registry=refresh_registry,
+            ).run()
+            second_factory = FakeBackendFactory({feed_url: FakeReply(rss)})
+
+            second = SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+                refresh_registry=refresh_registry,
+            ).run()
+
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            self.assertEqual(second["pages"]["pages"][0]["status"], "skipped")
+            self.assertEqual(second["pages"]["pages"][0]["skip_reason"], "never")
 
     def test_first_enabled_feed_selects_the_page_preset(self):
         first_feed = "https://one.example/feed.xml"
@@ -365,6 +681,7 @@ class SyncEngineTest(unittest.TestCase):
         config = parse_config(
             {
                 "archive-current-only": True,
+                "webpages": {"refresh-policy": "missing-only"},
                 "downloaders": {"default": {"backend": "fake"}},
                 "feeds": [{"url": feed_url, "download-webpages": True}],
             }
@@ -586,6 +903,54 @@ class SyncEngineTest(unittest.TestCase):
             self.assertFalse(old_path.exists())
             self.assertFalse(old_path.parent.exists())
             self.assertTrue(new_path.is_file())
+
+    def test_skipped_page_stays_in_its_recorded_storage_path(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        rss = rss_with_links(page_url)
+
+        def config(storage_path):
+            return parse_config(
+                {
+                    "archive-current-only": True,
+                    "webpages": {
+                        "storage-path": storage_path,
+                        "refresh-policy": "missing-only",
+                    },
+                    "downloaders": {"default": {"backend": "fake"}},
+                    "feeds": [{"url": feed_url, "download-webpages": True}],
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = SyncEngine(
+                config("old-pages"),
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(rss),
+                            page_url: FakeReply(b"<html>page</html>", "text/html"),
+                        }
+                    )
+                ),
+            ).run()
+            old_record = first["pages"]["pages"][0]
+            old_path = Path(directory, old_record["path"].removeprefix("/"))
+            second_factory = FakeBackendFactory({feed_url: FakeReply(rss)})
+
+            second = SyncEngine(
+                config("new-pages"),
+                root=directory,
+                registry=registry_with(second_factory),
+            ).run()
+
+            page_record = second["pages"]["pages"][0]
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            self.assertEqual(page_record["path"], old_record["path"])
+            self.assertEqual(page_record["status"], "skipped")
+            self.assertTrue(old_path.is_file())
+            self.assertFalse(Path(directory, "new-pages").exists())
 
     def test_current_only_does_not_delete_a_manifest_path_mismatched_to_url(self):
         feed_url = "https://example.com/feed.xml"

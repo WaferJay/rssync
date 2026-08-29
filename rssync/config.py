@@ -12,6 +12,10 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from rssync.rss import DEFAULT_RSS_IGNORE_TAGS
+from rssync.webpage_refresh import (
+    WebpageRefreshRegistry,
+    default_webpage_refresh_registry,
+)
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 +https://podnews.net/bot PodnewsBot/1.0"
 DEFAULT_REQUESTS_OPTIONS: dict[str, Any] = {
@@ -58,9 +62,10 @@ class RssConfig:
 
 @dataclass(frozen=True, slots=True)
 class WebpageConfig:
-    """Storage settings for archived webpages."""
+    """Storage and refresh settings for archived webpages."""
 
     storage_path: str = "pages"
+    refresh_policy: str = "always"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +87,7 @@ class FeedConfig:
     rss_downloader: str = "default"
     download_webpages: bool = False
     webpage_downloader: str = "default"
+    webpage_refresh_policy: str = "always"
     change_detection: RssChangeDetectionConfig = field(
         default_factory=RssChangeDetectionConfig
     )
@@ -295,6 +301,8 @@ def _parse_feeds(
     data: object,
     downloaders: Mapping[str, DownloaderPresetConfig],
     default_change_detection: RssChangeDetectionConfig,
+    default_webpage_refresh_policy: str,
+    refresh_registry: WebpageRefreshRegistry,
 ) -> tuple[FeedConfig, ...]:
     if not isinstance(data, list) or not data:
         raise ConfigError("feeds must be a non-empty array of objects")
@@ -311,6 +319,7 @@ def _parse_feeds(
                 "rss-downloader",
                 "download-webpages",
                 "webpage-downloader",
+                "webpage-refresh-policy",
                 "change-detection",
             },
             location,
@@ -343,6 +352,14 @@ def _parse_feeds(
                 rss_downloader=rss_downloader,
                 download_webpages=download_webpages,
                 webpage_downloader=webpage_downloader,
+                webpage_refresh_policy=_parse_refresh_policy(
+                    raw.get(
+                        "webpage-refresh-policy",
+                        default_webpage_refresh_policy,
+                    ),
+                    f"{location}.webpage-refresh-policy",
+                    refresh_registry,
+                ),
                 change_detection=_parse_change_detection(
                     raw.get("change-detection"),
                     f"{location}.change-detection",
@@ -353,11 +370,28 @@ def _parse_feeds(
     return tuple(feeds)
 
 
-def _parse_webpages(data: object) -> WebpageConfig:
-    if data is None:
-        return WebpageConfig()
-    raw = _mapping(data, "webpages")
-    _only_keys(raw, {"storage-path"}, "webpages")
+def _parse_refresh_policy(
+    value: object,
+    location: str,
+    refresh_registry: WebpageRefreshRegistry,
+) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{location} must be a non-empty string")
+    try:
+        refresh_registry.resolve(value)
+    except ValueError as error:
+        raise ConfigError(
+            f"{location} references an unknown strategy: {value}"
+        ) from error
+    return value
+
+
+def _parse_webpages(
+    data: object,
+    refresh_registry: WebpageRefreshRegistry,
+) -> WebpageConfig:
+    raw = {} if data is None else _mapping(data, "webpages")
+    _only_keys(raw, {"storage-path", "refresh-policy"}, "webpages")
 
     storage_path = raw.get("storage-path", "pages")
     if not isinstance(storage_path, str) or not storage_path:
@@ -365,12 +399,24 @@ def _parse_webpages(data: object) -> WebpageConfig:
     path = PurePath(storage_path)
     if path.is_absolute() or ".." in path.parts:
         raise ConfigError("webpages.storage-path must be a safe relative path")
-    return WebpageConfig(storage_path=storage_path)
+    return WebpageConfig(
+        storage_path=storage_path,
+        refresh_policy=_parse_refresh_policy(
+            raw.get("refresh-policy", "always"),
+            "webpages.refresh-policy",
+            refresh_registry,
+        ),
+    )
 
 
-def parse_config(data: object) -> AppConfig:
+def parse_config(
+    data: object,
+    *,
+    refresh_registry: WebpageRefreshRegistry | None = None,
+) -> AppConfig:
     """Parse a JSON-compatible value into a validated configuration."""
 
+    policy_registry = refresh_registry or default_webpage_refresh_registry()
     raw = _mapping(data, "configuration")
     _only_keys(
         raw,
@@ -389,19 +435,30 @@ def parse_config(data: object) -> AppConfig:
         raise ConfigError("archive-current-only must be a boolean")
     downloaders = _parse_downloaders(raw.get("downloaders"))
     rss = _parse_rss(raw.get("rss"))
-    feeds = _parse_feeds(raw.get("feeds"), downloaders, rss.change_detection)
+    webpages = _parse_webpages(raw.get("webpages"), policy_registry)
+    feeds = _parse_feeds(
+        raw.get("feeds"),
+        downloaders,
+        rss.change_detection,
+        webpages.refresh_policy,
+        policy_registry,
+    )
     return AppConfig(
         archive_current_only=archive_current_only,
         concurrency=_parse_concurrency(raw.get("concurrency")),
         rss=rss,
-        webpages=_parse_webpages(raw.get("webpages")),
+        webpages=webpages,
         downloaders=downloaders,
         feeds=feeds,
     )
 
 
-def load_config(path: str | Path) -> AppConfig:
+def load_config(
+    path: str | Path,
+    *,
+    refresh_registry: WebpageRefreshRegistry | None = None,
+) -> AppConfig:
     """Load and validate a JSON configuration file."""
 
     with Path(path).open("r", encoding="utf-8") as file:
-        return parse_config(json.load(file))
+        return parse_config(json.load(file), refresh_registry=refresh_registry)

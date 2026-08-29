@@ -21,7 +21,7 @@ from rssync.download_service import (
 )
 from rssync.downloaders.registry import DownloaderManager, DownloaderRegistry
 from rssync.manifests import load_feed_records, load_page_records
-from rssync.rss import RssDocument
+from rssync.rss import RssDocument, rss_documents_equal
 from rssync.storage import (
     manifest_path_relpath,
     rss_feed_local_url,
@@ -30,6 +30,12 @@ from rssync.storage import (
     webpage_relpath,
     write_json_atomic,
     write_rss_if_changed,
+)
+from rssync.webpage_refresh import (
+    WebpageRefreshContext,
+    WebpageRefreshRegistry,
+    WebpageRefreshStrategy,
+    default_webpage_refresh_registry,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +53,7 @@ class FeedOutcome:
     feed: FeedConfig
     download: DownloadedResource | None = None
     document: RssDocument | None = None
+    rss_changed: bool | None = None
     error: Exception | None = None
 
 
@@ -58,6 +65,7 @@ class PageTask:
     preset_name: str
     first_feed_url: str
     relpath: str
+    refresh_policy: str
 
 
 @dataclass(slots=True)
@@ -83,11 +91,21 @@ class SyncEngine:
         *,
         root: str | Path = ".",
         registry: DownloaderRegistry | None = None,
+        refresh_registry: WebpageRefreshRegistry | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self.root = Path(root)
         self.clock = clock
+        self.refresh_registry = (
+            refresh_registry or default_webpage_refresh_registry()
+        )
+        policy_names = {
+            feed.webpage_refresh_policy for feed in self.config.feeds
+        }
+        self.refresh_strategies: dict[str, WebpageRefreshStrategy] = {
+            name: self.refresh_registry.resolve(name) for name in policy_names
+        }
         self.manager = DownloaderManager(config.downloaders, registry)
 
     def _preset_limits(self, resource_kind: str) -> dict[str, int]:
@@ -158,25 +176,64 @@ class SyncEngine:
         ]
         return self._run_grouped(tasks, limits, worker)
 
-    def _select_page_tasks(
-        self, feed_outcomes: Mapping[int, FeedOutcome]
-    ) -> dict[str, PageTask]:
+    def _detect_feed_changes(
+        self,
+        feed_outcomes: Mapping[int, FeedOutcome],
+    ) -> None:
+        """Determine meaningful RSS changes before selecting webpage tasks."""
+
+        for index, feed in enumerate(self.config.feeds):
+            outcome = feed_outcomes[index]
+            if outcome.document is None:
+                continue
+            target = self.root / RSS_FEED_PATH / rss_feed_relpath(feed.url)
+            outcome.rss_changed = not target.is_file() or not rss_documents_equal(
+                target.read_bytes(),
+                outcome.document.source,
+                feed.change_detection.ignore_tags,
+            )
+
+    def _select_pages(
+        self,
+        feed_outcomes: Mapping[int, FeedOutcome],
+        previous_pages: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[dict[str, PageTask], dict[str, PageTask]]:
+        candidates: dict[str, PageTask] = {}
         tasks: dict[str, PageTask] = {}
+        cache_validity: dict[str, bool] = {}
         for index, feed in enumerate(self.config.feeds):
             outcome = feed_outcomes[index]
             if not feed.download_webpages or outcome.document is None:
                 continue
+            if outcome.rss_changed is None:
+                raise AssertionError("parsed RSS has no change result")
+            strategy = self.refresh_strategies[feed.webpage_refresh_policy]
             for link in outcome.document.links:
-                tasks.setdefault(
-                    link.canonical_url,
-                    PageTask(
-                        canonical_url=link.canonical_url,
-                        preset_name=feed.webpage_downloader,
-                        first_feed_url=feed.url,
-                        relpath=webpage_relpath(link.canonical_url),
-                    ),
+                task = PageTask(
+                    canonical_url=link.canonical_url,
+                    preset_name=feed.webpage_downloader,
+                    first_feed_url=feed.url,
+                    relpath=webpage_relpath(link.canonical_url),
+                    refresh_policy=feed.webpage_refresh_policy,
                 )
-        return tasks
+                candidates.setdefault(link.canonical_url, task)
+                if link.canonical_url not in cache_validity:
+                    cache_validity[link.canonical_url] = self._valid_page_cache(
+                        previous_pages.get(link.canonical_url)
+                    )
+                cache_valid = cache_validity[link.canonical_url]
+                context = WebpageRefreshContext(
+                    canonical_url=link.canonical_url,
+                    feed_url=feed.url,
+                    cache_valid=cache_valid,
+                    rss_changed=outcome.rss_changed,
+                )
+                if (
+                    link.canonical_url not in tasks
+                    and (not cache_valid or strategy.should_fetch(context))
+                ):
+                    tasks[link.canonical_url] = task
+        return candidates, tasks
 
     def _protected_page_urls(
         self,
@@ -257,7 +314,7 @@ class SyncEngine:
 
     def _update_pages(
         self,
-        tasks: Mapping[str, PageTask],
+        candidates: Mapping[str, PageTask],
         outcomes: Mapping[str, PageOutcome],
         previous: Mapping[str, Mapping[str, Any]],
         protected_urls: Collection[str],
@@ -277,9 +334,25 @@ class SyncEngine:
             records = {url: dict(record) for url, record in previous.items()}
         changed_paths: list[str] = []
 
-        for canonical_url, task in tasks.items():
-            outcome = outcomes[canonical_url]
+        for canonical_url, candidate in candidates.items():
             prior = previous.get(canonical_url)
+            outcome = outcomes.get(canonical_url)
+            if outcome is None:
+                if not self._valid_page_cache(prior):
+                    raise AssertionError("skipped webpage has no valid cache")
+                record = dict(prior or {})
+                record.pop("last_error", None)
+                record.update(
+                    {
+                        "changed": False,
+                        "status": "skipped",
+                        "skip_reason": candidate.refresh_policy,
+                    }
+                )
+                records[canonical_url] = record
+                continue
+
+            task = outcome.task
             if outcome.download is not None:
                 downloaded = outcome.download
                 path = webpage_manifest_path(
@@ -318,6 +391,7 @@ class SyncEngine:
                     changed_paths.append(path)
             elif self._valid_page_cache(prior):
                 record = dict(prior or {})
+                record.pop("skip_reason", None)
                 record.update(
                     {
                         "changed": False,
@@ -486,6 +560,7 @@ class SyncEngine:
             outcome.document.source,
             feed.change_detection.ignore_tags,
         )
+        outcome.rss_changed = changed
         downloaded = outcome.download
         updated_at = downloaded.fetched_at if changed else previous.get("updated_at")
         record = {
@@ -496,6 +571,7 @@ class SyncEngine:
             "rss_backend": downloaded.backend_name,
             "webpage_downloader": feed.webpage_downloader,
             "webpage_backend": self.manager.backend_name(feed.webpage_downloader),
+            "webpage_refresh_policy": feed.webpage_refresh_policy,
             "download_webpages": feed.download_webpages,
             "change_detection": {
                 "ignore_tags": list(feed.change_detection.ignore_tags)
@@ -517,7 +593,12 @@ class SyncEngine:
             previous_feeds = load_feed_records(self.root / RSS_FEED_MANIFEST_PATH)
             previous_pages = load_page_records(self.root / WEBPAGE_MANIFEST_PATH)
             feed_outcomes = self._fetch_feeds()
-            page_tasks = self._select_page_tasks(feed_outcomes)
+            self._detect_feed_changes(feed_outcomes)
+
+            page_candidates, page_tasks = self._select_pages(
+                feed_outcomes,
+                previous_pages,
+            )
             page_outcomes = self._fetch_pages(page_tasks)
             if self.config.archive_current_only:
                 protected_pages, webpage_cleanup_safe = self._protected_page_urls(
@@ -527,7 +608,7 @@ class SyncEngine:
             else:
                 protected_pages, webpage_cleanup_safe = set(), True
             page_records, changed_pages, obsolete_pages = self._update_pages(
-                page_tasks,
+                page_candidates,
                 page_outcomes,
                 previous_pages,
                 protected_pages,
@@ -576,13 +657,14 @@ class SyncEngine:
                     "changed": changed_pages,
                 },
             }
-            if page_tasks or (self.root / WEBPAGE_MANIFEST_PATH).exists():
+            if page_candidates or (self.root / WEBPAGE_MANIFEST_PATH).exists():
                 write_json_atomic(self.root / WEBPAGE_MANIFEST_PATH, page_manifest)
             logger.info(
-                "Synchronized %d/%d feeds and %d webpages",
+                "Synchronized %d/%d feeds and downloaded %d/%d webpages",
                 len(feed_records),
                 len(self.config.feeds),
                 len(page_tasks),
+                len(page_candidates),
             )
             return {"feeds": feed_manifest, "pages": page_manifest}
         finally:

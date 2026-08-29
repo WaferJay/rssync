@@ -57,6 +57,8 @@ accepted. Each feed supports:
 - `rss-downloader`: preset used for RSS XML; defaults to `default`.
 - `download-webpages`: whether item webpages are archived; defaults to `false`.
 - `webpage-downloader`: webpage preset; defaults to `default`.
+- `webpage-refresh-policy`: optional override for the global webpage refresh
+  policy.
 - `change-detection`: optional per-feed override for RSS comparison rules.
 
 Archived webpages are stored under `pages/` by default. The location can be
@@ -65,13 +67,57 @@ changed without configuring a publication host:
 ```json
 {
   "webpages": {
-    "storage-path": "pages"
+    "storage-path": "pages",
+    "refresh-policy": "on-rss-change"
   }
 }
 ```
 
 `public-base-url` is not supported. RSS item links always retain their original
 text, including relative links.
+
+## Webpage refresh policies
+
+The global `webpages.refresh-policy` setting controls when an existing webpage
+archive is downloaded again. It supports three built-in strategies:
+
+- `always` downloads every current webpage on every successful RSS fetch. This
+  is the default and preserves the historical behavior.
+- `on-rss-change` downloads existing webpages only when the RSS document has a
+  meaningful change under its configured RSS change-detection rules.
+- `missing-only` treats an existing webpage archive as immutable and never
+  downloads it again.
+
+All strategies download a page when its manifest record is missing or unsafe,
+or when the recorded file no longer exists. An unrecorded file is not treated
+as a cache entry. A feed can override the global strategy:
+
+```json
+{
+  "webpages": {
+    "refresh-policy": "on-rss-change"
+  },
+  "feeds": [
+    {
+      "url": "https://example.com/rss.xml",
+      "download-webpages": true,
+      "webpage-refresh-policy": "missing-only"
+    }
+  ]
+}
+```
+
+When multiple feeds reference the same canonical URL, rssync downloads it once
+if any referencing feed's strategy requests a refresh. The first such feed in
+configuration order selects the webpage downloader. A policy-skipped page keeps
+its original timestamps and download metadata and is reported with `skipped`
+status in `pages.json`. If `storage-path` changes, a skipped archive remains at
+its recorded path; newly downloaded pages use the new storage path.
+
+Refresh decisions use the `WebpageRefreshStrategy` protocol and
+`WebpageRefreshRegistry` in `rssync.webpage_refresh`. Applications can register
+and inject another strategy into both configuration parsing and `SyncEngine`;
+the synchronization orchestration does not need strategy-specific branches.
 
 ## RSS change detection
 

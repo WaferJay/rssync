@@ -1,6 +1,14 @@
 import unittest
 
 from rssync.config import ConfigError, parse_config
+from rssync.webpage_refresh import default_webpage_refresh_registry
+
+
+class CustomRefreshStrategy:
+    name = "custom"
+
+    def should_fetch(self, context):
+        return False
 
 
 class ConfigTest(unittest.TestCase):
@@ -10,6 +18,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.feeds[0].rss_downloader, "default")
         self.assertEqual(config.feeds[0].webpage_downloader, "default")
         self.assertFalse(config.feeds[0].download_webpages)
+        self.assertEqual(config.webpages.refresh_policy, "always")
+        self.assertEqual(config.feeds[0].webpage_refresh_policy, "always")
         self.assertFalse(config.archive_current_only)
         self.assertEqual(config.downloaders["default"].backend, "requests")
         self.assertTrue(config.downloaders["default"].options["use-session"])
@@ -64,6 +74,66 @@ class ConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(config.webpages.storage_path, "pages")
+
+    def test_feed_refresh_policy_overrides_the_global_policy(self):
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "on-rss-change"},
+                "feeds": [
+                    {"url": "https://example.com/inherited.xml"},
+                    {
+                        "url": "https://example.com/immutable.xml",
+                        "webpage-refresh-policy": "missing-only",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(config.webpages.refresh_policy, "on-rss-change")
+        self.assertEqual(
+            config.feeds[0].webpage_refresh_policy,
+            "on-rss-change",
+        )
+        self.assertEqual(
+            config.feeds[1].webpage_refresh_policy,
+            "missing-only",
+        )
+
+    def test_unknown_refresh_policies_are_rejected(self):
+        invalid_configs = [
+            {
+                "webpages": {"refresh-policy": "unknown"},
+                "feeds": [{"url": "https://example.com/feed.xml"}],
+            },
+            {
+                "feeds": [
+                    {
+                        "url": "https://example.com/feed.xml",
+                        "webpage-refresh-policy": "unknown",
+                    }
+                ]
+            },
+        ]
+        for config in invalid_configs:
+            with self.subTest(config=config), self.assertRaisesRegex(
+                ConfigError,
+                "unknown strategy",
+            ):
+                parse_config(config)
+
+    def test_custom_refresh_policy_can_be_injected(self):
+        registry = default_webpage_refresh_registry()
+        registry.register(CustomRefreshStrategy())
+
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "custom"},
+                "feeds": [{"url": "https://example.com/feed.xml"}],
+            },
+            refresh_registry=registry,
+        )
+
+        self.assertEqual(config.feeds[0].webpage_refresh_policy, "custom")
 
     def test_removed_public_base_url_is_rejected(self):
         with self.assertRaisesRegex(ConfigError, "unknown webpages field"):
