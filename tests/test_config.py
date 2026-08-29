@@ -10,6 +10,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.feeds[0].rss_downloader, "default")
         self.assertEqual(config.feeds[0].webpage_downloader, "default")
         self.assertFalse(config.feeds[0].download_webpages)
+        self.assertFalse(config.archive_current_only)
         self.assertEqual(config.downloaders["default"].backend, "requests")
         self.assertTrue(config.downloaders["default"].options["use-session"])
         self.assertEqual(config.rss.change_detection.ignore_tags, ("lastBuildDate",))
@@ -17,6 +18,25 @@ class ConfigTest(unittest.TestCase):
             config.feeds[0].change_detection.ignore_tags,
             ("lastBuildDate",),
         )
+
+    def test_archive_current_only_requires_a_boolean(self):
+        config = parse_config(
+            {
+                "archive-current-only": True,
+                "feeds": [{"url": "https://example.com/rss.xml"}],
+            }
+        )
+        self.assertTrue(config.archive_current_only)
+
+        with self.assertRaisesRegex(
+            ConfigError, "archive-current-only must be a boolean"
+        ):
+            parse_config(
+                {
+                    "archive-current-only": "true",
+                    "feeds": [{"url": "https://example.com/rss.xml"}],
+                }
+            )
 
     def test_default_preset_is_partially_overridden(self):
         config = parse_config(

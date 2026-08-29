@@ -1,4 +1,5 @@
 {
+    "archive-current-only": false,
     "concurrency": {
         "rss-downloads": 2,
         "webpage-downloads": 8

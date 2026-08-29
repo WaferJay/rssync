@@ -22,6 +22,35 @@ The smallest valid configuration is:
 }
 ```
 
+By default, rssync keeps files from feeds and webpage links that later disappear.
+Set the top-level `archive-current-only` option to keep only the archive that can
+be attributed to the current configuration and latest usable RSS documents:
+
+```json
+{
+  "archive-current-only": true,
+  "feeds": [
+    {
+      "url": "https://example.com/rss.xml",
+      "download-webpages": true
+    }
+  ]
+}
+```
+
+In this mode, removing a configured feed removes its previously recorded RSS
+file. A webpage is removed from `pages.json` and storage after it is no longer
+linked by any configured feed whose webpage downloads are enabled. Shared links
+remain archived while at least one such feed still references them. Empty
+archive subdirectories created by removed files are also cleaned up.
+
+RSS download or parsing failures retain the previous RSS and protect the pages
+referenced by that last usable document. If those references cannot be recovered
+safely, webpage cleanup is skipped for that run. For deletion safety, rssync only
+removes files whose ownership can be verified from the previous manifests; it
+does not sweep unrecorded files from archive directories. The option defaults to
+`false` for backward compatibility.
+
 Feeds must be objects. The historical string-only `feeds` array is no longer
 accepted. Each feed supports:
 
@@ -178,4 +207,5 @@ not generate that derived RSS.
 If an RSS fetch or parse fails, the previous original feed is retained. If a
 webpage refresh fails, a valid existing archive is reported with `cached`
 status; without a cache, it is reported as `failed`. RSS links are unaffected.
-Historical webpage files are not automatically deleted.
+Historical webpage files are not automatically deleted unless
+`archive-current-only` is enabled.

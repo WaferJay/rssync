@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
 from rssync.config import AppConfig, FeedConfig
@@ -177,6 +178,46 @@ class SyncEngine:
                 )
         return tasks
 
+    def _protected_page_urls(
+        self,
+        feed_outcomes: Mapping[int, FeedOutcome],
+        previous_feeds: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[set[str], bool]:
+        """Recover webpage references from retained RSS after fetch failures."""
+
+        protected: set[str] = set()
+        for index, feed in enumerate(self.config.feeds):
+            outcome = feed_outcomes[index]
+            if not feed.download_webpages or outcome.document is not None:
+                continue
+
+            previous = previous_feeds.get(feed.url, {})
+            target = self.root / RSS_FEED_PATH / rss_feed_relpath(feed.url)
+            if not target.is_file():
+                if previous:
+                    logger.warning(
+                        "Skipping webpage cleanup because retained RSS is missing: %s",
+                        feed.url,
+                    )
+                    return set(), False
+                continue
+
+            base_url = previous.get("final_url", feed.url)
+            if not isinstance(base_url, str) or not base_url:
+                base_url = feed.url
+            try:
+                document = RssDocument.parse(target.read_bytes(), base_url)
+            except Exception:
+                logger.warning(
+                    "Skipping webpage cleanup because retained RSS cannot be "
+                    "parsed: %s",
+                    feed.url,
+                    exc_info=True,
+                )
+                return set(), False
+            protected.update(link.canonical_url for link in document.links)
+        return protected, True
+
     def _fetch_pages(self, tasks: Mapping[str, PageTask]) -> dict[str, PageOutcome]:
         if not tasks:
             return {}
@@ -218,10 +259,22 @@ class SyncEngine:
         self,
         tasks: Mapping[str, PageTask],
         outcomes: Mapping[str, PageOutcome],
-    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-        manifest_path = self.root / WEBPAGE_MANIFEST_PATH
-        previous = load_page_records(manifest_path)
-        records = dict(previous)
+        previous: Mapping[str, Mapping[str, Any]],
+        protected_urls: Collection[str],
+        cleanup_safe: bool,
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[str],
+        dict[str, dict[str, Any]],
+    ]:
+        if self.config.archive_current_only and cleanup_safe:
+            records = {
+                url: dict(record)
+                for url, record in previous.items()
+                if url in protected_urls
+            }
+        else:
+            records = {url: dict(record) for url, record in previous.items()}
         changed_paths: list[str] = []
 
         for canonical_url, task in tasks.items():
@@ -283,7 +336,127 @@ class SyncEngine:
                     "status": "failed",
                     "last_error": str(outcome.error),
                 }
-        return records, changed_paths
+        obsolete = (
+            {
+                url: dict(record)
+                for url, record in previous.items()
+                if url not in records
+                or record.get("path") != records[url].get("path")
+            }
+            if self.config.archive_current_only and cleanup_safe
+            else {}
+        )
+        return records, changed_paths, obsolete
+
+    def _remove_archive_file(self, target: Path, managed_root: Path) -> bool:
+        """Remove one owned archive file and its now-empty parent directories."""
+
+        resolved_root = managed_root.resolve()
+        resolved_parent = target.parent.resolve()
+        if not resolved_parent.is_relative_to(resolved_root):
+            logger.warning(
+                "Refusing to delete archive path outside its root: %s",
+                target,
+            )
+            return False
+
+        existed = target.is_file() or target.is_symlink()
+        target.unlink(missing_ok=True)
+        if existed:
+            logger.info("Deleted obsolete archive: %s", target)
+
+        parent = target.parent
+        while parent != managed_root:
+            try:
+                parent.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                    break
+                raise
+            parent = parent.parent
+        return existed
+
+    def _page_cleanup_target(
+        self,
+        source_url: str,
+        record: Mapping[str, Any],
+    ) -> tuple[PurePosixPath, Path, Path] | None:
+        """Validate a manifest-owned webpage path and recover its storage root."""
+
+        path = record.get("path")
+        if not isinstance(path, str):
+            return None
+        relative = manifest_path_relpath(path)
+        if relative is None:
+            logger.warning("Ignoring unsafe obsolete webpage path: %s", path)
+            return None
+
+        expected = PurePosixPath(webpage_relpath(source_url))
+        expected_length = len(expected.parts)
+        if (
+            len(relative.parts) < expected_length
+            or relative.parts[-expected_length:] != expected.parts
+        ):
+            logger.warning(
+                "Ignoring obsolete webpage path that does not match its URL: %s",
+                path,
+            )
+            return None
+
+        storage_parts = relative.parts[:-expected_length]
+        managed_root = self.root.joinpath(*storage_parts)
+        target = self.root.joinpath(*relative.parts)
+        return relative, target, managed_root
+
+    def _cleanup_obsolete_archives(
+        self,
+        obsolete_feeds: Mapping[str, Mapping[str, Any]],
+        obsolete_pages: Mapping[str, Mapping[str, Any]],
+        current_pages: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Delete only obsolete files whose ownership is proven by old manifests."""
+
+        current_feed_relpaths = {
+            PurePosixPath(rss_feed_relpath(feed.url)) for feed in self.config.feeds
+        }
+        for source_url, record in obsolete_feeds.items():
+            expected = PurePosixPath(RSS_FEED_PATH) / PurePosixPath(
+                rss_feed_relpath(source_url)
+            )
+            path = record.get("path")
+            recorded = manifest_path_relpath(path) if isinstance(path, str) else None
+            if recorded != expected:
+                logger.warning(
+                    "Ignoring obsolete RSS path that does not match its URL: %s",
+                    path,
+                )
+                continue
+
+            relpath = PurePosixPath(rss_feed_relpath(source_url))
+            if relpath in current_feed_relpaths:
+                continue
+            for directory in (RSS_FEED_PATH, RSS_FEED_NEW_PATH):
+                managed_root = self.root / directory
+                self._remove_archive_file(
+                    managed_root.joinpath(*relpath.parts),
+                    managed_root,
+                )
+
+        current_page_paths: set[PurePosixPath] = set()
+        for source_url, record in current_pages.items():
+            cleanup_target = self._page_cleanup_target(source_url, record)
+            if cleanup_target is not None:
+                current_page_paths.add(cleanup_target[0])
+        for source_url, record in obsolete_pages.items():
+            cleanup_target = self._page_cleanup_target(source_url, record)
+            if cleanup_target is None:
+                continue
+            relative, target, managed_root = cleanup_target
+            if relative in current_page_paths:
+                continue
+            self._remove_archive_file(target, managed_root)
 
     def _feed_record(
         self,
@@ -341,12 +514,26 @@ class SyncEngine:
         """Execute a complete synchronization and return both manifests."""
 
         try:
+            previous_feeds = load_feed_records(self.root / RSS_FEED_MANIFEST_PATH)
+            previous_pages = load_page_records(self.root / WEBPAGE_MANIFEST_PATH)
             feed_outcomes = self._fetch_feeds()
             page_tasks = self._select_page_tasks(feed_outcomes)
             page_outcomes = self._fetch_pages(page_tasks)
-            page_records, changed_pages = self._update_pages(page_tasks, page_outcomes)
+            if self.config.archive_current_only:
+                protected_pages, webpage_cleanup_safe = self._protected_page_urls(
+                    feed_outcomes,
+                    previous_feeds,
+                )
+            else:
+                protected_pages, webpage_cleanup_safe = set(), True
+            page_records, changed_pages, obsolete_pages = self._update_pages(
+                page_tasks,
+                page_outcomes,
+                previous_pages,
+                protected_pages,
+                webpage_cleanup_safe,
+            )
 
-            previous_feeds = load_feed_records(self.root / RSS_FEED_MANIFEST_PATH)
             feed_records: list[dict[str, Any]] = []
             changed_feeds: list[str] = []
             for index, feed in enumerate(self.config.feeds):
@@ -358,6 +545,19 @@ class SyncEngine:
                     feed_records.append(record)
                 if changed_path is not None:
                     changed_feeds.append(changed_path)
+
+            if self.config.archive_current_only:
+                configured_feed_urls = {feed.url for feed in self.config.feeds}
+                obsolete_feeds = {
+                    url: record
+                    for url, record in previous_feeds.items()
+                    if url not in configured_feed_urls
+                }
+                self._cleanup_obsolete_archives(
+                    obsolete_feeds,
+                    obsolete_pages,
+                    page_records,
+                )
 
             completed_at = int(self.clock())
             feed_manifest = {

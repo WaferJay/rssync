@@ -96,6 +96,7 @@ class AppConfig:
     webpages: WebpageConfig
     downloaders: Mapping[str, DownloaderPresetConfig]
     feeds: tuple[FeedConfig, ...]
+    archive_current_only: bool = False
 
     def downloader(self, name: str) -> DownloaderPresetConfig:
         """Return a named preset from the validated configuration."""
@@ -373,13 +374,24 @@ def parse_config(data: object) -> AppConfig:
     raw = _mapping(data, "configuration")
     _only_keys(
         raw,
-        {"concurrency", "rss", "webpages", "downloaders", "feeds"},
+        {
+            "archive-current-only",
+            "concurrency",
+            "rss",
+            "webpages",
+            "downloaders",
+            "feeds",
+        },
         "top-level",
     )
+    archive_current_only = raw.get("archive-current-only", False)
+    if not isinstance(archive_current_only, bool):
+        raise ConfigError("archive-current-only must be a boolean")
     downloaders = _parse_downloaders(raw.get("downloaders"))
     rss = _parse_rss(raw.get("rss"))
     feeds = _parse_feeds(raw.get("feeds"), downloaders, rss.change_detection)
     return AppConfig(
+        archive_current_only=archive_current_only,
         concurrency=_parse_concurrency(raw.get("concurrency")),
         rss=rss,
         webpages=_parse_webpages(raw.get("webpages")),
