@@ -24,10 +24,64 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.downloaders["default"].backend, "requests")
         self.assertTrue(config.downloaders["default"].options["use-session"])
         self.assertEqual(config.rss.change_detection.ignore_tags, ("lastBuildDate",))
+        self.assertEqual(config.concurrency.rss_downloads, 2)
+        self.assertEqual(config.concurrency.webpage_downloads, 8)
+        self.assertIsNone(config.concurrency.per_domain_downloads)
+        self.assertEqual(config.concurrency.request_interval, 0)
         self.assertEqual(
             config.feeds[0].change_detection.ignore_tags,
             ("lastBuildDate",),
         )
+
+    def test_global_concurrency_and_request_interval_are_parsed(self):
+        config = parse_config(
+            {
+                "concurrency": {
+                    "rss-downloads": 3,
+                    "webpage-downloads": 12,
+                    "per-domain-downloads": 2,
+                    "request-interval": 0.75,
+                },
+                "feeds": [{"url": "https://example.com/rss.xml"}],
+            }
+        )
+
+        self.assertEqual(config.concurrency.rss_downloads, 3)
+        self.assertEqual(config.concurrency.webpage_downloads, 12)
+        self.assertEqual(config.concurrency.per_domain_downloads, 2)
+        self.assertEqual(config.concurrency.request_interval, 0.75)
+
+    def test_invalid_domain_concurrency_and_request_intervals_are_rejected(self):
+        invalid_fields = [
+            ("per-domain-downloads", 0),
+            ("per-domain-downloads", None),
+            ("per-domain-downloads", True),
+            ("request-interval", -0.1),
+            ("request-interval", True),
+            ("request-interval", float("nan")),
+            ("request-interval", float("inf")),
+        ]
+        for field, value in invalid_fields:
+            with self.subTest(field=field, value=value), self.assertRaises(
+                ConfigError
+            ):
+                parse_config(
+                    {
+                        "concurrency": {field: value},
+                        "feeds": [{"url": "https://example.com/rss.xml"}],
+                    }
+                )
+
+    def test_downloader_preset_concurrency_is_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "unknown downloaders.default field"):
+            parse_config(
+                {
+                    "downloaders": {
+                        "default": {"concurrency": {"rss-downloads": 1}}
+                    },
+                    "feeds": [{"url": "https://example.com/rss.xml"}],
+                }
+            )
 
     def test_archive_current_only_requires_a_boolean(self):
         config = parse_config(

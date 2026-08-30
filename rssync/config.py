@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -38,10 +39,12 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ConcurrencyConfig:
-    """Global limits for the two synchronization stages."""
+    """Global concurrency and request pacing settings."""
 
     rss_downloads: int = 2
     webpage_downloads: int = 8
+    per_domain_downloads: int | None = None
+    request_interval: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +78,6 @@ class DownloaderPresetConfig:
     name: str
     backend: str
     options: Mapping[str, Any]
-    rss_concurrency: int | None = None
-    webpage_concurrency: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +127,15 @@ def _positive_int(value: object, location: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(f"{location} must be a positive integer")
     return value
+
+
+def _non_negative_number(value: object, location: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{location} must be a number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ConfigError(f"{location} must be a non-negative finite number")
+    return result
 
 
 def _http_url(value: object, location: str) -> str:
@@ -178,7 +188,16 @@ def _parse_concurrency(data: object) -> ConcurrencyConfig:
     if data is None:
         return ConcurrencyConfig()
     values = _mapping(data, "concurrency")
-    _only_keys(values, {"rss-downloads", "webpage-downloads"}, "concurrency")
+    _only_keys(
+        values,
+        {
+            "rss-downloads",
+            "webpage-downloads",
+            "per-domain-downloads",
+            "request-interval",
+        },
+        "concurrency",
+    )
     return ConcurrencyConfig(
         rss_downloads=_positive_int(
             values.get("rss-downloads", 2), "concurrency.rss-downloads"
@@ -187,29 +206,18 @@ def _parse_concurrency(data: object) -> ConcurrencyConfig:
             values.get("webpage-downloads", 8),
             "concurrency.webpage-downloads",
         ),
-    )
-
-
-def _parse_preset_concurrency(
-    data: object, location: str
-) -> tuple[int | None, int | None]:
-    if data is None:
-        return None, None
-    values = _mapping(data, f"{location}.concurrency")
-    _only_keys(
-        values,
-        {"rss-downloads", "webpage-downloads"},
-        f"{location}.concurrency",
-    )
-    rss = values.get("rss-downloads")
-    webpage = values.get("webpage-downloads")
-    return (
-        _positive_int(rss, f"{location}.concurrency.rss-downloads")
-        if rss is not None
-        else None,
-        _positive_int(webpage, f"{location}.concurrency.webpage-downloads")
-        if webpage is not None
-        else None,
+        per_domain_downloads=(
+            _positive_int(
+                values["per-domain-downloads"],
+                "concurrency.per-domain-downloads",
+            )
+            if "per-domain-downloads" in values
+            else None
+        ),
+        request_interval=_non_negative_number(
+            values.get("request-interval", 0),
+            "concurrency.request-interval",
+        ),
     )
 
 
@@ -223,7 +231,7 @@ def _parse_downloaders(data: object) -> Mapping[str, DownloaderPresetConfig]:
     for name in names:
         location = f"downloaders.{name}"
         raw = _mapping(raw_downloaders.get(name, {}), location)
-        _only_keys(raw, {"backend", "concurrency", "options"}, location)
+        _only_keys(raw, {"backend", "options"}, location)
 
         if name == "default":
             backend = raw.get("backend", "requests")
@@ -239,15 +247,10 @@ def _parse_downloaders(data: object) -> Mapping[str, DownloaderPresetConfig]:
             options = _deep_merge(DEFAULT_REQUESTS_OPTIONS, options)
         else:
             options = deepcopy(dict(options))
-        rss_limit, webpage_limit = _parse_preset_concurrency(
-            raw.get("concurrency"), location
-        )
         presets[name] = DownloaderPresetConfig(
             name=name,
             backend=backend,
             options=_freeze(options),
-            rss_concurrency=rss_limit,
-            webpage_concurrency=webpage_limit,
         )
     return MappingProxyType(presets)
 

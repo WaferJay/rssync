@@ -46,7 +46,12 @@ def fetch_rss_xml(url: str, basepath: str = ".") -> tuple[str, str]:
     limit = config.concurrency.rss_downloads
     service = DownloadService(
         manager,
-        DownloadConcurrency(limit, {"default": limit}),
+        DownloadConcurrency(
+            limit,
+            config.concurrency.webpage_downloads,
+            config.concurrency.per_domain_downloads,
+            config.concurrency.request_interval,
+        ),
     )
     try:
         service.download(

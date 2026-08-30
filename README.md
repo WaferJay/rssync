@@ -210,22 +210,30 @@ downloader instance per worker thread.
 {
   "concurrency": {
     "rss-downloads": 2,
-    "webpage-downloads": 8
-  },
-  "downloaders": {
-    "default": {
-      "concurrency": {
-        "rss-downloads": 2,
-        "webpage-downloads": 4
-      }
-    }
+    "webpage-downloads": 8,
+    "per-domain-downloads": 2,
+    "request-interval": 0.5
   }
 }
 ```
 
-The top-level values limit all active requests in each synchronization stage.
-Preset values limit that preset within the corresponding stage and inherit the
-global value when omitted. RSS downloads finish before webpage downloads begin.
+`rss-downloads` and `webpage-downloads` limit all active attempts in their
+respective synchronization stages. RSS downloads finish before webpage downloads
+begin. Their defaults are 2 and 8.
+
+`per-domain-downloads` optionally limits active attempts for each hostname. The
+limit is shared by all downloader presets and both stages; protocol and port do
+not create separate buckets. Omitting it leaves per-domain concurrency
+unlimited.
+
+`request-interval` is the minimum number of seconds between the actual start
+times of two attempts for the same hostname. It accepts zero and fractional
+values, defaults to 0, and applies to retries as well as initial attempts.
+Different hostnames are paced independently. Retry backoff and `Retry-After`
+remain in effect in addition to this interval.
+
+All concurrency settings are top-level. Downloader presets do not accept a
+`concurrency` field.
 
 ## Archived data and manifests
 

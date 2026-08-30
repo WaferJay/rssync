@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import Semaphore
+from threading import Lock, Semaphore
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 
 from rssync.downloaders.base import (
     DownloadHTTPError,
@@ -49,28 +50,82 @@ class DownloadedResource:
 
 
 class DownloadConcurrency:
-    """Apply one stage-wide and one per-preset active-attempt limit."""
+    """Apply stage-wide and cross-preset per-host request limits."""
 
-    def __init__(self, global_limit: int, preset_limits: Mapping[str, int]) -> None:
-        self._global = Semaphore(global_limit)
-        self._presets = {
-            name: Semaphore(limit) for name, limit in preset_limits.items()
+    @dataclass(slots=True)
+    class _DomainState:
+        semaphore: Semaphore | None
+        start_lock: Lock
+        last_started: float | None = None
+
+    def __init__(
+        self,
+        rss_limit: int,
+        webpage_limit: int,
+        per_domain_limit: int | None = None,
+        request_interval: float = 0.0,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._stages = {
+            "rss": Semaphore(rss_limit),
+            "webpage": Semaphore(webpage_limit),
         }
+        self._per_domain_limit = per_domain_limit
+        self._request_interval = request_interval
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._domains: dict[str, DownloadConcurrency._DomainState] = {}
+        self._domains_lock = Lock()
+
+    def _domain_state(self, url: str) -> _DomainState:
+        hostname = urlsplit(url).hostname
+        if hostname is None:
+            raise ValueError(f"download URL does not contain a hostname: {url}")
+        hostname = hostname.casefold()
+        with self._domains_lock:
+            state = self._domains.get(hostname)
+            if state is None:
+                state = self._DomainState(
+                    semaphore=(
+                        Semaphore(self._per_domain_limit)
+                        if self._per_domain_limit is not None
+                        else None
+                    ),
+                    start_lock=Lock(),
+                )
+                self._domains[hostname] = state
+            return state
 
     @contextmanager
-    def slot(self, preset_name: str) -> Iterator[None]:
-        """Reserve active network capacity for one complete attempt."""
+    def slot(self, resource_kind: ResourceKind, url: str) -> Iterator[None]:
+        """Reserve stage and hostname capacity for one complete attempt."""
 
-        preset = self._presets[preset_name]
-        preset.acquire()
+        stage = self._stages[resource_kind]
+        domain = self._domain_state(url)
+        if domain.semaphore is not None:
+            domain.semaphore.acquire()
+        stage_acquired = False
         try:
-            self._global.acquire()
+            with domain.start_lock:
+                if domain.last_started is not None:
+                    earliest_start = domain.last_started + self._request_interval
+                    while (delay := earliest_start - self._monotonic()) > 0:
+                        self._sleep(delay)
+                stage.acquire()
+                stage_acquired = True
+                domain.last_started = self._monotonic()
             try:
                 yield
             finally:
-                self._global.release()
+                stage.release()
+                stage_acquired = False
         finally:
-            preset.release()
+            if stage_acquired:
+                stage.release()
+            if domain.semaphore is not None:
+                domain.semaphore.release()
 
 
 def _media_type(headers: Mapping[str, str]) -> str | None:
@@ -149,33 +204,42 @@ class DownloadService:
             retry_after: float | None = None
             retryable = False
             try:
-                with self.concurrency.slot(preset_name):
+                with self.concurrency.slot(
+                    prepared.resource_kind,
+                    prepared.url,
+                ):
                     response = downloader.open_attempt(prepared)
-                    headers = dict(response.headers)
-                    status_code = response.status_code
-                    final_url = response.final_url
-                    if not 200 <= status_code < 300:
-                        retryable = status_code in policy.status_codes
-                        retry_after = _retry_after_seconds(
-                            _header(headers, "Retry-After")
-                        )
-                        raise DownloadHTTPError(status_code, final_url)
+                    try:
+                        headers = dict(response.headers)
+                        status_code = response.status_code
+                        final_url = response.final_url
+                        if not 200 <= status_code < 300:
+                            retryable = status_code in policy.status_codes
+                            retry_after = _retry_after_seconds(
+                                _header(headers, "Retry-After")
+                            )
+                            raise DownloadHTTPError(status_code, final_url)
 
-                    content_type = _media_type(headers)
-                    if (
-                        resource_kind == "webpage"
-                        and content_type not in HTML_CONTENT_TYPES
-                    ):
-                        raise UnsupportedContentType(content_type, final_url)
+                        content_type = _media_type(headers)
+                        if (
+                            resource_kind == "webpage"
+                            and content_type not in HTML_CONTENT_TYPES
+                        ):
+                            raise UnsupportedContentType(content_type, final_url)
 
-                    temporary = temporary_sibling(target_path)
-                    digest = hashlib.sha256()
-                    byte_count = 0
-                    with temporary.open("wb") as file:
-                        for chunk in response.iter_bytes():
-                            file.write(chunk)
-                            digest.update(chunk)
-                            byte_count += len(chunk)
+                        temporary = temporary_sibling(target_path)
+                        digest = hashlib.sha256()
+                        byte_count = 0
+                        with temporary.open("wb") as file:
+                            for chunk in response.iter_bytes():
+                                file.write(chunk)
+                                digest.update(chunk)
+                                byte_count += len(chunk)
+                    finally:
+                        try:
+                            response.close()
+                        finally:
+                            response = None
 
                 digest_value = digest.hexdigest()
                 changed = commit_download(temporary, target_path, digest_value)

@@ -2,7 +2,9 @@
     "archive-current-only": false,
     "concurrency": {
         "rss-downloads": 2,
-        "webpage-downloads": 8
+        "webpage-downloads": 8,
+        "per-domain-downloads": 2,
+        "request-interval": 0.5
     },
     "rss": {
         "change-detection": {
@@ -30,10 +32,6 @@
         },
         "rotating": {
             "backend": "requests",
-            "concurrency": {
-                "rss-downloads": 1,
-                "webpage-downloads": 2
-            },
             "options": {
                 "use-session": false,
                 "user-agent": {

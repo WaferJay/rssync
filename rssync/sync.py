@@ -6,9 +6,7 @@ import concurrent.futures
 import errno
 import logging
 import time
-from collections import defaultdict
 from collections.abc import Callable, Collection, Hashable, Iterable, Mapping
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
@@ -107,58 +105,46 @@ class SyncEngine:
             name: self.refresh_registry.resolve(name) for name in policy_names
         }
         self.manager = DownloaderManager(config.downloaders, registry)
-
-    def _preset_limits(self, resource_kind: str) -> dict[str, int]:
-        global_limit = (
-            self.config.concurrency.rss_downloads
-            if resource_kind == "rss"
-            else self.config.concurrency.webpage_downloads
+        self.concurrency = DownloadConcurrency(
+            config.concurrency.rss_downloads,
+            config.concurrency.webpage_downloads,
+            config.concurrency.per_domain_downloads,
+            config.concurrency.request_interval,
         )
-        limits: dict[str, int] = {}
-        for name, preset in self.config.downloaders.items():
-            configured = (
-                preset.rss_concurrency
-                if resource_kind == "rss"
-                else preset.webpage_concurrency
-            )
-            limits[name] = configured or global_limit
-        return limits
+        self.service = DownloadService(
+            self.manager,
+            self.concurrency,
+            clock=self.clock,
+        )
 
-    def _run_grouped(
+    def _run_parallel(
         self,
-        tasks: Iterable[tuple[TaskKey, str, TaskValue]],
-        limits: Mapping[str, int],
+        tasks: Iterable[tuple[TaskKey, TaskValue]],
+        limit: int,
+        thread_name_prefix: str,
         worker: Callable[[TaskValue], TaskResult],
     ) -> dict[TaskKey, TaskResult]:
-        groups: dict[str, list[tuple[TaskKey, TaskValue]]] = defaultdict(list)
-        for key, preset_name, task in tasks:
-            groups[preset_name].append((key, task))
+        queued = list(tasks)
+        if not queued:
+            return {}
         results: dict[TaskKey, TaskResult] = {}
-        with ExitStack() as stack:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(limit, len(queued)),
+            thread_name_prefix=thread_name_prefix,
+        ) as executor:
             futures: dict[concurrent.futures.Future[TaskResult], TaskKey] = {}
-            for preset_name, group in groups.items():
-                executor = stack.enter_context(
-                    concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(limits[preset_name], len(group)),
-                        thread_name_prefix=f"rssync-{preset_name}",
-                    )
-                )
-                for key, task in group:
-                    futures[executor.submit(worker, task)] = key
+            for key, task in queued:
+                futures[executor.submit(worker, task)] = key
             for future in concurrent.futures.as_completed(futures):
                 results[futures[future]] = future.result()
         return results
 
     def _fetch_feeds(self) -> dict[int, FeedOutcome]:
-        limits = self._preset_limits("rss")
-        concurrency = DownloadConcurrency(self.config.concurrency.rss_downloads, limits)
-        service = DownloadService(self.manager, concurrency, clock=self.clock)
-
         def worker(item: tuple[int, FeedConfig]) -> FeedOutcome:
             index, feed = item
             try:
                 target = self.root / RSS_FEED_NEW_PATH / rss_feed_relpath(feed.url)
-                downloaded = service.download(
+                downloaded = self.service.download(
                     url=feed.url,
                     resource_kind="rss",
                     preset_name=feed.rss_downloader,
@@ -171,10 +157,15 @@ class SyncEngine:
                 return FeedOutcome(index, feed, error=error)
 
         tasks = [
-            (index, feed.rss_downloader, (index, feed))
+            (index, (index, feed))
             for index, feed in enumerate(self.config.feeds)
         ]
-        return self._run_grouped(tasks, limits, worker)
+        return self._run_parallel(
+            tasks,
+            self.config.concurrency.rss_downloads,
+            "rssync-rss",
+            worker,
+        )
 
     def _detect_feed_changes(
         self,
@@ -278,16 +269,11 @@ class SyncEngine:
     def _fetch_pages(self, tasks: Mapping[str, PageTask]) -> dict[str, PageOutcome]:
         if not tasks:
             return {}
-        limits = self._preset_limits("webpage")
-        concurrency = DownloadConcurrency(
-            self.config.concurrency.webpage_downloads, limits
-        )
-        service = DownloadService(self.manager, concurrency, clock=self.clock)
 
         def worker(task: PageTask) -> PageOutcome:
             try:
                 target = self.root / self.config.webpages.storage_path / task.relpath
-                downloaded = service.download(
+                downloaded = self.service.download(
                     url=task.canonical_url,
                     resource_kind="webpage",
                     preset_name=task.preset_name,
@@ -301,8 +287,13 @@ class SyncEngine:
                 )
                 return PageOutcome(task, error=error)
 
-        grouped_tasks = [(url, task.preset_name, task) for url, task in tasks.items()]
-        return self._run_grouped(grouped_tasks, limits, worker)
+        queued_tasks = [(url, task) for url, task in tasks.items()]
+        return self._run_parallel(
+            queued_tasks,
+            self.config.concurrency.webpage_downloads,
+            "rssync-webpage",
+            worker,
+        )
 
     def _valid_page_cache(self, record: Mapping[str, Any] | None) -> bool:
         if not record or not isinstance(record.get("path"), str):

@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
+from urllib.parse import urlsplit
 
 from rssync.downloaders.base import (
     DownloaderRuntimeContext,
@@ -42,7 +43,8 @@ class FakeResponse:
         self._label = label
 
     def iter_bytes(self) -> Iterable[bytes]:
-        self._factory.enter(self._label)
+        hostname = urlsplit(self.requested_url).hostname or ""
+        self._factory.enter(self._label, hostname)
         try:
             if self._reply.delay:
                 time.sleep(self._reply.delay)
@@ -50,7 +52,7 @@ class FakeResponse:
             yield self._reply.body[:midpoint]
             yield self._reply.body[midpoint:]
         finally:
-            self._factory.exit(self._label)
+            self._factory.exit(self._label, hostname)
 
     def close(self) -> None:
         return None
@@ -108,8 +110,10 @@ class FakeBackendFactory:
         self.max_active = 0
         self.active_by_label: dict[str, int] = {}
         self.max_active_by_label: dict[str, int] = {}
+        self.active_by_hostname: dict[str, int] = {}
+        self.max_active_by_hostname: dict[str, int] = {}
 
-    def enter(self, label: str) -> None:
+    def enter(self, label: str, hostname: str) -> None:
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -118,11 +122,17 @@ class FakeBackendFactory:
             self.max_active_by_label[label] = max(
                 self.max_active_by_label.get(label, 0), active
             )
+            domain_active = self.active_by_hostname.get(hostname, 0) + 1
+            self.active_by_hostname[hostname] = domain_active
+            self.max_active_by_hostname[hostname] = max(
+                self.max_active_by_hostname.get(hostname, 0), domain_active
+            )
 
-    def exit(self, label: str) -> None:
+    def exit(self, label: str, hostname: str) -> None:
         with self.lock:
             self.active -= 1
             self.active_by_label[label] -= 1
+            self.active_by_hostname[hostname] -= 1
 
     def validate_options(self, options: Mapping[str, Any]) -> Mapping[str, Any]:
         return dict(options)

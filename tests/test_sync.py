@@ -474,8 +474,69 @@ class SyncEngineTest(unittest.TestCase):
         page_calls = [call for call in factory.calls if call[0] == "webpage"]
         self.assertEqual(page_calls, [("webpage", page_url, "first")])
 
-    def test_rss_stage_honors_global_and_per_preset_concurrency(self):
-        feed_urls = [f"https://example.com/feed-{index}.xml" for index in range(6)]
+    def test_rss_stage_honors_global_and_cross_preset_domain_concurrency(self):
+        feeds = [
+            (f"https://{hostname}/feed-{index}.xml", index)
+            for index in range(3)
+            for hostname in ("example.com", "example.org")
+        ]
+        rss = b'<rss version="2.0"><channel /></rss>'
+        factory = FakeBackendFactory(
+            {url: FakeReply(rss, delay=0.03) for url, _ in feeds}
+        )
+        config = parse_config(
+            {
+                "concurrency": {
+                    "rss-downloads": 4,
+                    "webpage-downloads": 2,
+                    "per-domain-downloads": 1,
+                },
+                "downloaders": {
+                    "default": {
+                        "backend": "fake",
+                        "options": {"label": "one"},
+                    },
+                    "two": {
+                        "backend": "fake",
+                        "options": {"label": "two"},
+                    },
+                },
+                "feeds": [
+                    {
+                        "url": url,
+                        "rss-downloader": "default" if index % 2 == 0 else "two",
+                    }
+                    for url, index in feeds
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+        self.assertLessEqual(factory.max_active, 4)
+        self.assertEqual(factory.max_active, 2)
+        self.assertEqual(factory.max_active_by_hostname["example.com"], 1)
+        self.assertEqual(factory.max_active_by_hostname["example.org"], 1)
+        labels_by_hostname = {
+            hostname: {
+                label
+                for _, url, label in factory.calls
+                if url.startswith(f"https://{hostname}/")
+            }
+            for hostname in ("example.com", "example.org")
+        }
+        self.assertEqual(labels_by_hostname["example.com"], {"one", "two"})
+        self.assertEqual(labels_by_hostname["example.org"], {"one", "two"})
+
+    def test_rss_stage_honors_global_concurrency_across_presets(self):
+        feed_urls = [
+            f"https://example.net/feed-{index}.xml" for index in range(6)
+        ]
         rss = b'<rss version="2.0"><channel /></rss>'
         factory = FakeBackendFactory(
             {url: FakeReply(rss, delay=0.03) for url in feed_urls}
@@ -489,19 +550,17 @@ class SyncEngineTest(unittest.TestCase):
                 "downloaders": {
                     "default": {
                         "backend": "fake",
-                        "concurrency": {"rss-downloads": 1},
                         "options": {"label": "one"},
                     },
                     "two": {
                         "backend": "fake",
-                        "concurrency": {"rss-downloads": 2},
                         "options": {"label": "two"},
                     },
                 },
                 "feeds": [
                     {
                         "url": url,
-                        "rss-downloader": "default" if index < 3 else "two",
+                        "rss-downloader": "default" if index % 2 == 0 else "two",
                     }
                     for index, url in enumerate(feed_urls)
                 ],
@@ -515,9 +574,8 @@ class SyncEngineTest(unittest.TestCase):
                 registry=registry_with(factory),
             ).run()
 
-        self.assertLessEqual(factory.max_active, 2)
-        self.assertLessEqual(factory.max_active_by_label["one"], 1)
-        self.assertLessEqual(factory.max_active_by_label["two"], 2)
+        self.assertEqual(factory.max_active, 2)
+        self.assertEqual(set(factory.max_active_by_label), {"one", "two"})
 
     def test_failed_webpage_refresh_uses_existing_cache(self):
         feed_url = "https://example.com/feed.xml"
