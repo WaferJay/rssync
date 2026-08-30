@@ -23,6 +23,16 @@ from rssync.downloaders.base import (
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1'
+}
+
+
 @dataclass(frozen=True, slots=True)
 class UserAgentOptions:
     """User-Agent selection settings for the requests backend."""
@@ -225,14 +235,16 @@ class RequestsDownloader:
         self, request: PreparedDownloadRequest
     ) -> RequestsDownloadResponse:
         request_method = self._session.request if self._session else requests.request
+        headers = dict(request.headers)
+        headers.update(DEFAULT_HEADERS)
         response = request_method(
             "GET",
             request.url,
-            headers=dict(request.headers),
+            headers=headers,
             timeout=self.options.timeout,
             verify=self.options.verify_tls,
             allow_redirects=True,
-            stream=True,
+            stream=False,
         )
         return RequestsDownloadResponse(response, request.url)
 
