@@ -577,6 +577,75 @@ class SyncEngineTest(unittest.TestCase):
         self.assertEqual(factory.max_active, 2)
         self.assertEqual(set(factory.max_active_by_label), {"one", "two"})
 
+    def test_webpage_stage_does_not_starve_later_hostnames(self):
+        hostnames = [f"site-{index}.example" for index in range(8)]
+        feed_urls = [f"https://{hostname}/rss.xml" for hostname in hostnames]
+        page_urls = {
+            feed_url: [f"https://{hostname}/article-{index}" for index in range(8)]
+            for feed_url, hostname in zip(feed_urls, hostnames, strict=True)
+        }
+        replies = {
+            feed_url: FakeReply(rss_with_links(*page_urls[feed_url]))
+            for feed_url in feed_urls
+        }
+        replies.update(
+            {
+                page_url: FakeReply(
+                    b"<html>page</html>",
+                    "text/html",
+                    delay=0.03,
+                )
+                for urls in page_urls.values()
+                for page_url in urls
+            }
+        )
+        factory = FakeBackendFactory(replies)
+        config = parse_config(
+            {
+                "concurrency": {
+                    "rss-downloads": 8,
+                    "webpage-downloads": 8,
+                    "per-domain-downloads": 2,
+                },
+                "downloaders": {
+                    "default": {
+                        "backend": "fake",
+                        "options": {"label": "rss"},
+                    },
+                    "pages": {
+                        "backend": "fake",
+                        "options": {"label": "pages"},
+                    },
+                },
+                "feeds": [
+                    {
+                        "url": feed_url,
+                        "download-webpages": True,
+                        "webpage-downloader": "pages",
+                    }
+                    for feed_url in feed_urls
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+        first_page_calls = [
+            url for kind, url, _ in factory.calls if kind == "webpage"
+        ][:8]
+        self.assertEqual(
+            set(first_page_calls),
+            {urls[0] for urls in page_urls.values()},
+        )
+        self.assertEqual(factory.max_active_by_label["pages"], 8)
+        for hostname in hostnames:
+            self.assertLessEqual(factory.max_active_by_hostname[hostname], 2)
+
     def test_failed_webpage_refresh_uses_existing_cache(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/page"

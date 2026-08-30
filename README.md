@@ -224,7 +224,8 @@ begin. Their defaults are 2 and 8.
 `per-domain-downloads` optionally limits active attempts for each hostname. The
 limit is shared by all downloader presets and both stages; protocol and port do
 not create separate buckets. Omitting it leaves per-domain concurrency
-unlimited.
+unlimited. When configured, queued downloads are interleaved by hostname so
+tasks waiting for one busy hostname do not occupy every worker.
 
 `request-interval` is the minimum number of seconds between the actual start
 times of two attempts for the same hostname. It accepts zero and fractional

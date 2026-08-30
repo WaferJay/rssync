@@ -6,10 +6,12 @@ import concurrent.futures
 import errno
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Collection, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 from rssync.config import AppConfig, FeedConfig
 from rssync.download_service import (
@@ -80,6 +82,30 @@ TaskValue = TypeVar("TaskValue")
 TaskResult = TypeVar("TaskResult")
 
 
+def _interleave_by_hostname(
+    tasks: Iterable[tuple[TaskKey, TaskValue]],
+    task_url: Callable[[TaskValue], str],
+) -> list[tuple[TaskKey, TaskValue]]:
+    """Keep host-local order while round-robin interleaving host queues."""
+
+    grouped: dict[str, deque[tuple[TaskKey, TaskValue]]] = {}
+    for item in tasks:
+        url = task_url(item[1])
+        hostname = urlsplit(url).hostname
+        if hostname is None:
+            raise ValueError(f"download URL does not contain a hostname: {url}")
+        grouped.setdefault(hostname.casefold(), deque()).append(item)
+
+    pending = deque(grouped.values())
+    interleaved: list[tuple[TaskKey, TaskValue]] = []
+    while pending:
+        hostname_tasks = pending.popleft()
+        interleaved.append(hostname_tasks.popleft())
+        if hostname_tasks:
+            pending.append(hostname_tasks)
+    return interleaved
+
+
 class SyncEngine:
     """Synchronize configured RSS feeds and optionally archive item pages."""
 
@@ -123,8 +149,12 @@ class SyncEngine:
         limit: int,
         thread_name_prefix: str,
         worker: Callable[[TaskValue], TaskResult],
+        task_url: Callable[[TaskValue], str] | None = None,
     ) -> dict[TaskKey, TaskResult]:
         queued = list(tasks)
+        if task_url is not None:
+            # Do not let tasks waiting on one domain consume every worker.
+            queued = _interleave_by_hostname(queued, task_url)
         if not queued:
             return {}
         results: dict[TaskKey, TaskResult] = {}
@@ -165,6 +195,11 @@ class SyncEngine:
             self.config.concurrency.rss_downloads,
             "rssync-rss",
             worker,
+            task_url=(
+                (lambda item: item[1].url)
+                if self.config.concurrency.per_domain_downloads is not None
+                else None
+            ),
         )
 
     def _detect_feed_changes(
@@ -293,6 +328,11 @@ class SyncEngine:
             self.config.concurrency.webpage_downloads,
             "rssync-webpage",
             worker,
+            task_url=(
+                (lambda task: task.canonical_url)
+                if self.config.concurrency.per_domain_downloads is not None
+                else None
+            ),
         )
 
     def _valid_page_cache(self, record: Mapping[str, Any] | None) -> bool:
