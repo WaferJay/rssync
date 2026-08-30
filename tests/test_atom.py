@@ -9,7 +9,7 @@ ATOM = f"{{{ATOM_NAMESPACE}}}"
 
 
 class AtomGenerationTest(unittest.TestCase):
-    def test_maps_rss_metadata_and_uses_root_relative_local_links(self):
+    def test_maps_rss_metadata_and_uses_document_relative_local_links(self):
         source = b"""<?xml version="1.0"?>
 <rss version="2.0">
   <channel>
@@ -76,7 +76,7 @@ class AtomGenerationTest(unittest.TestCase):
         }
         self.assertEqual(
             feed_links["self"]["href"],
-            "/atoms/example.com/news/feed.xml",
+            "feed.xml",
         )
         self.assertEqual(
             feed_links["via"]["href"],
@@ -109,7 +109,10 @@ class AtomGenerationTest(unittest.TestCase):
             link.attrib["rel"]: link.attrib
             for link in entry.findall(f"{ATOM}link")
         }
-        self.assertEqual(entry_links["alternate"]["href"], page_path)
+        self.assertEqual(
+            entry_links["alternate"]["href"],
+            "../../../pages/example.com/story--0123456789ab.html",
+        )
         self.assertEqual(
             entry_links["alternate"]["type"],
             "text/html; charset=utf-8",

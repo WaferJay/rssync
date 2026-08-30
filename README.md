@@ -91,10 +91,11 @@ example, `feeds/example.com/news/feed.xml` maps to
 `atoms/example.com/news/feed.xml`.
 
 Generated Atom documents do not contain `xml:base`. Their `self` links and local
-entry `alternate` links are root-relative paths such as `/atoms/...` and
-`/pages/...`, so a consumer resolves them against the origin from which the Atom
-document was retrieved. Entry IDs remain absolute as required by Atom. A local
-entry also includes its original webpage URL as an absolute `via` link.
+entry `alternate` links are relative to the Atom document, such as `feed.xml`
+and `../../../pages/...`. A consumer therefore preserves any URL path prefix
+under which the archive directories are deployed. Entry IDs remain absolute as
+required by Atom. A local entry also includes its original webpage URL as an
+absolute `via` link.
 
 `webpages.atom.missing-page-policy` controls entries whose webpage has no valid
 local archive:

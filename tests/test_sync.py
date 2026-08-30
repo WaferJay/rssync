@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urljoin
 
 from rssync.config import parse_config
 from rssync.downloaders.registry import DownloaderRegistry
@@ -114,7 +115,7 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-    async def test_atom_feed_is_generated_with_stable_root_relative_links(self):
+    async def test_atom_feed_is_generated_with_stable_relative_links(self):
         feed_url = "https://example.com/news/feed.xml"
         page_url = "https://example.com/article"
         feed_body = b"""<rss version="2.0"><channel>
@@ -168,9 +169,29 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
                 "atom:entry/atom:link[@rel='alternate']",
                 namespace,
             )
+            self_link = root.find(
+                "atom:link[@rel='self']",
+                namespace,
+            )
             page_path = first["pages"]["pages"][0]["path"]
-            self.assertEqual(entry_alternate.attrib["href"], page_path)
+            self.assertEqual(self_link.attrib["href"], "feed.xml")
+            self.assertEqual(
+                entry_alternate.attrib["href"],
+                f"../../../{page_path.removeprefix('/')}",
+            )
             self.assertTrue(page_path.startswith("/pages/"))
+            deployed_atom_url = (
+                "https://archive.example/base"
+                f"{feed_record['atom_path']}"
+            )
+            self.assertEqual(
+                urljoin(deployed_atom_url, self_link.attrib["href"]),
+                deployed_atom_url,
+            )
+            self.assertEqual(
+                urljoin(deployed_atom_url, entry_alternate.attrib["href"]),
+                "https://archive.example/base" + page_path,
+            )
 
             second = await SyncEngine(
                 config,

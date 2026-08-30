@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import posixpath
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Collection, Mapping
@@ -95,6 +96,12 @@ def _link(
     ET.SubElement(parent, _atom("link"), attributes)
 
 
+def _relative_local_href(document_path: str, target_path: str) -> str:
+    """Return a local target relative to the Atom document's directory."""
+
+    return posixpath.relpath(target_path, posixpath.dirname(document_path))
+
+
 def _entry_candidates(
     document: RssDocument,
     page_records: Mapping[str, Mapping[str, Any]],
@@ -165,7 +172,12 @@ def build_atom_feed(
     ET.SubElement(root, _atom("id")).text = source_feed_url
     ET.SubElement(root, _atom("updated")).text = _rfc3339(feed_updated)
     _author(root, document.channel.author or "rssync")
-    _link(root, "self", self_path, media_type="application/atom+xml")
+    _link(
+        root,
+        "self",
+        _relative_local_href(self_path, self_path),
+        media_type="application/atom+xml",
+    )
     if document.channel.link:
         _link(root, "alternate", document.channel.link)
     _link(root, "via", source_feed_url, media_type="application/rss+xml")
@@ -198,7 +210,7 @@ def build_atom_feed(
             _link(
                 entry,
                 "alternate",
-                path,
+                _relative_local_href(self_path, path),
                 media_type=_valid_media_type(page_record.get("content_type")),
             )
             _link(entry, "via", source_link.resolved_url)
