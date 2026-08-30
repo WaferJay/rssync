@@ -15,7 +15,11 @@
     },
     "webpages": {
         "storage-path": "pages",
-        "refresh-policy": "always"
+        "refresh-policy": "always",
+        "atom": {
+            "storage-path": "atoms",
+            "missing-page-policy": "ignore"
+        }
     },
     "downloaders": {
         "default": {

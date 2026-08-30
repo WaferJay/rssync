@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from rssync.config import parse_config
@@ -104,6 +105,7 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 manifests["pages"]["sync"]["changed"], [page_record["path"]]
             )
+            self.assertNotIn("changed_atoms", manifests["feeds"]["sync"])
             self.assertEqual(
                 factory.calls,
                 [
@@ -111,6 +113,298 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
                     ("webpage", page_url, "default"),
                 ],
             )
+
+    async def test_atom_feed_is_generated_with_stable_root_relative_links(self):
+        feed_url = "https://example.com/news/feed.xml"
+        page_url = "https://example.com/article"
+        feed_body = b"""<rss version="2.0"><channel>
+<title>Example Feed</title>
+<item><title>Article</title><guid>article-1</guid>
+<link>/article</link></item></channel></rss>"""
+        page_body = b"<html>archived</html>"
+        config = parse_config(
+            {
+                "webpages": {"atom": {"storage-path": "atoms"}},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(feed_body),
+                            page_url: FakeReply(page_body, "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+
+            feed_record = first["feeds"]["feeds"][0]
+            self.assertEqual(
+                feed_record["atom_path"],
+                "/atoms/example.com/news/feed.xml",
+            )
+            self.assertTrue(feed_record["atom_changed"])
+            self.assertEqual(feed_record["atom_updated_at"], 100)
+            self.assertEqual(
+                first["feeds"]["sync"]["changed_atoms"],
+                [feed_record["atom_path"]],
+            )
+            atom_path = Path(directory, feed_record["atom_path"].removeprefix("/"))
+            first_bytes = atom_path.read_bytes()
+            root = ET.fromstring(first_bytes)
+            namespace = {"atom": "http://www.w3.org/2005/Atom"}
+            self.assertNotIn(
+                "{http://www.w3.org/XML/1998/namespace}base",
+                root.attrib,
+            )
+            entry_alternate = root.find(
+                "atom:entry/atom:link[@rel='alternate']",
+                namespace,
+            )
+            page_path = first["pages"]["pages"][0]["path"]
+            self.assertEqual(entry_alternate.attrib["href"], page_path)
+            self.assertTrue(page_path.startswith("/pages/"))
+
+            second = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(feed_body),
+                            page_url: FakeReply(page_body, "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 200,
+            ).run()
+
+            second_record = second["feeds"]["feeds"][0]
+            self.assertFalse(second_record["atom_changed"])
+            self.assertEqual(second_record["atom_updated_at"], 100)
+            self.assertEqual(second["feeds"]["sync"]["changed_atoms"], [])
+            self.assertEqual(atom_path.read_bytes(), first_bytes)
+
+    async def test_atom_source_url_policy_keeps_failed_webpage_entry(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/missing"
+        feed_body = rss_with_links(page_url)
+        config = parse_config(
+            {
+                "webpages": {"atom": {"missing-page-policy": "source-url"}},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(feed_body),
+                            page_url: FakeReply(
+                                b"unavailable",
+                                "text/html",
+                                status=500,
+                            ),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+
+            atom_path = result["feeds"]["feeds"][0]["atom_path"]
+            root = ET.parse(
+                Path(directory, atom_path.removeprefix("/"))
+            ).getroot()
+            namespace = {"atom": "http://www.w3.org/2005/Atom"}
+            links = root.findall("atom:entry/atom:link", namespace)
+            self.assertEqual(len(links), 1)
+            self.assertEqual(links[0].attrib["rel"], "alternate")
+            self.assertEqual(links[0].attrib["href"], page_url)
+
+    async def test_atom_uses_retained_rss_after_a_fetch_failure(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        feed_body = rss_with_links(page_url)
+        config = parse_config(
+            {
+                "archive-current-only": True,
+                "webpages": {
+                    "refresh-policy": "missing-only",
+                    "atom": {},
+                },
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(feed_body),
+                            page_url: FakeReply(b"<html>page</html>", "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+            first_record = first["feeds"]["feeds"][0]
+            atom_path = Path(
+                directory,
+                first_record["atom_path"].removeprefix("/"),
+            )
+            atom_bytes = atom_path.read_bytes()
+
+            second = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(b"invalid RSS")})
+                ),
+                clock=lambda: 200,
+            ).run()
+
+            second_record = second["feeds"]["feeds"][0]
+            self.assertEqual(second_record["status"], "retained")
+            self.assertEqual(second_record["atom_status"], "retained")
+            self.assertFalse(second_record["atom_changed"])
+            self.assertEqual(second_record["atom_updated_at"], 100)
+            self.assertEqual(atom_path.read_bytes(), atom_bytes)
+
+    async def test_atom_uses_the_persisted_rss_after_an_ignored_change(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        first_rss = (
+            b"<rss><channel>"
+            b"<lastBuildDate>Mon, 01 Jan 2024 00:00:00 GMT</lastBuildDate>"
+            b"<item><link>https://example.com/article</link></item>"
+            b"</channel></rss>"
+        )
+        second_rss = first_rss.replace(
+            b"Mon, 01 Jan 2024 00:00:00 GMT",
+            b"Tue, 02 Jan 2024 00:00:00 GMT",
+        )
+        config = parse_config(
+            {
+                "webpages": {
+                    "refresh-policy": "missing-only",
+                    "atom": {},
+                },
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(first_rss),
+                            page_url: FakeReply(b"<html>page</html>", "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+            atom_path = Path(
+                directory,
+                first["feeds"]["feeds"][0]["atom_path"].removeprefix("/"),
+            )
+            first_atom = atom_path.read_bytes()
+
+            second = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(second_rss)})
+                ),
+                clock=lambda: 200,
+            ).run()
+
+            self.assertFalse(second["feeds"]["feeds"][0]["changed"])
+            self.assertFalse(second["feeds"]["feeds"][0]["atom_changed"])
+            self.assertEqual(atom_path.read_bytes(), first_atom)
+
+    async def test_current_only_removes_replaced_and_disabled_atom_outputs(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article"
+        feed_body = rss_with_links(page_url)
+
+        def config(atom_path):
+            webpages = {"refresh-policy": "missing-only"}
+            if atom_path is not None:
+                webpages["atom"] = {"storage-path": atom_path}
+            return parse_config(
+                {
+                    "archive-current-only": True,
+                    "webpages": webpages,
+                    "downloaders": {"default": {"backend": "fake"}},
+                    "feeds": [{"url": feed_url, "download-webpages": True}],
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await SyncEngine(
+                config("old-atoms"),
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(feed_body),
+                            page_url: FakeReply(b"<html>page</html>", "text/html"),
+                        }
+                    )
+                ),
+                clock=lambda: 100,
+            ).run()
+            old_atom = Path(
+                directory,
+                first["feeds"]["feeds"][0]["atom_path"].removeprefix("/"),
+            )
+
+            second = await SyncEngine(
+                config("new-atoms"),
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(feed_body)})
+                ),
+                clock=lambda: 200,
+            ).run()
+            new_atom = Path(
+                directory,
+                second["feeds"]["feeds"][0]["atom_path"].removeprefix("/"),
+            )
+            self.assertFalse(old_atom.exists())
+            self.assertTrue(new_atom.is_file())
+
+            third = await SyncEngine(
+                config(None),
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(feed_body)})
+                ),
+                clock=lambda: 300,
+            ).run()
+            self.assertFalse(new_atom.exists())
+            self.assertNotIn("atom_path", third["feeds"]["feeds"][0])
 
     async def test_on_rss_change_skips_when_only_ignored_tags_change(self):
         feed_url = "https://example.com/feed.xml"
@@ -743,6 +1037,7 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
         first_config = parse_config(
             {
                 "archive-current-only": True,
+                "webpages": {"atom": {}},
                 "downloaders": {"default": {"backend": "fake"}},
                 "feeds": [
                     {"url": removed_feed, "download-webpages": True},
@@ -753,6 +1048,7 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
         second_config = parse_config(
             {
                 "archive-current-only": True,
+                "webpages": {"atom": {}},
                 "downloaders": {"default": {"backend": "fake"}},
                 "feeds": [{"url": retained_feed}],
             }
@@ -780,9 +1076,11 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
             removed_download = Path(
                 directory, ".new-feeds/removed.example/feed.xml"
             )
+            removed_atom = Path(directory, "atoms/removed.example/feed.xml")
             self.assertTrue(page_path.is_file())
             self.assertTrue(removed_rss.is_file())
             self.assertTrue(removed_download.is_file())
+            self.assertTrue(removed_atom.is_file())
 
             second = await SyncEngine(
                 second_config,
@@ -801,6 +1099,8 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(removed_rss.parent.exists())
             self.assertFalse(removed_download.exists())
             self.assertFalse(removed_download.parent.exists())
+            self.assertFalse(removed_atom.exists())
+            self.assertFalse(removed_atom.parent.exists())
 
     async def test_current_only_removes_page_missing_from_latest_rss(self):
         feed_url = "https://example.com/feed.xml"

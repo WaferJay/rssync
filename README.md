@@ -2,6 +2,8 @@
 
 `rssync` downloads RSS 2.0 feeds into `feeds/` without rewriting their contents.
 A feed can also archive the raw HTML response behind each `<item><link>`.
+For feeds whose webpages are archived, rssync can generate an Atom view whose
+entries point at those local files.
 `feeds.json` and `pages.json` expose the relationship between the original RSS
 and archived pages so publication tooling can choose its own URL prefix.
 
@@ -39,10 +41,12 @@ be attributed to the current configuration and latest usable RSS documents:
 ```
 
 In this mode, removing a configured feed removes its previously recorded RSS
-file. A webpage is removed from `pages.json` and storage after it is no longer
-linked by any configured feed whose webpage downloads are enabled. Shared links
-remain archived while at least one such feed still references them. Empty
-archive subdirectories created by removed files are also cleaned up.
+file and managed Atom output. Reconfiguring or disabling Atom output removes the
+old managed Atom path. A webpage is removed from `pages.json` and storage after
+it is no longer linked by any configured feed whose webpage downloads are
+enabled. Shared links remain archived while at least one such feed still
+references them. Empty archive subdirectories created by removed files are also
+cleaned up.
 
 RSS download or parsing failures retain the previous RSS and protect the pages
 referenced by that last usable document. If those references cannot be recovered
@@ -68,13 +72,40 @@ changed without configuring a publication host:
 {
   "webpages": {
     "storage-path": "pages",
-    "refresh-policy": "on-rss-change"
+    "refresh-policy": "on-rss-change",
+    "atom": {
+      "storage-path": "atoms",
+      "missing-page-policy": "ignore"
+    }
   }
 }
 ```
 
 `public-base-url` is not supported. RSS item links always retain their original
 text, including relative links.
+
+The optional `webpages.atom` object enables one derived Atom document for every
+configured feed with `download-webpages: true`. Its `storage-path` defaults to
+`atoms`; each output reuses the corresponding RSS path below that directory. For
+example, `feeds/example.com/news/feed.xml` maps to
+`atoms/example.com/news/feed.xml`.
+
+Generated Atom documents do not contain `xml:base`. Their `self` links and local
+entry `alternate` links are root-relative paths such as `/atoms/...` and
+`/pages/...`, so a consumer resolves them against the origin from which the Atom
+document was retrieved. Entry IDs remain absolute as required by Atom. A local
+entry also includes its original webpage URL as an absolute `via` link.
+
+`webpages.atom.missing-page-policy` controls entries whose webpage has no valid
+local archive:
+
+- `ignore`, the default, omits the entry.
+- `source-url` retains the entry and uses the original absolute webpage URL as
+  its `alternate` link.
+
+RSS channel and item titles, descriptions, authors, categories, GUIDs, and valid
+dates are mapped where Atom has an equivalent. Archived HTML remains in its own
+file and is not embedded in the Atom document.
 
 ## Webpage refresh policies
 
@@ -252,22 +283,27 @@ downloads. Relative images, stylesheets, and scripts may therefore not render
 correctly from the archive.
 
 `feeds.json` describes original archived RSS files and their resolved downloader
-presets. `pages.json` records archived paths, canonical source and final URLs,
-response headers, SHA-256 hashes, downloader metadata, timestamps, and current
-status.
+presets. When Atom output is enabled, each applicable feed record also reports
+`atom_path`, `atom_updated_at`, `atom_changed`, and `atom_status`; the sync record
+lists changed Atom paths in `changed_atoms`. `pages.json` records archived paths,
+canonical source and final URLs, response headers, SHA-256 hashes, downloader
+metadata, timestamps, and current status.
 
-Manifest paths are root-relative and never contain a schema or host. RSS paths
+Manifest paths are root-relative and never contain a URL scheme or authority. RSS paths
 look like `/feeds/example.com/feed.xml`; webpage paths look like
-`/pages/example.com/article--012345abcdef.html`. On disk, these are relative to
-the synchronization root after removing the leading `/`.
+`/pages/example.com/article--012345abcdef.html`; default Atom paths look like
+`/atoms/example.com/feed.xml`. On disk, these are relative to the synchronization
+root after removing the leading `/`.
 
-A downstream RSS generator can resolve an item link against the corresponding
-`feeds[].final_url`, canonicalize it, find the matching `pages[].source_url`, and
-prepend its own origin or deployment prefix to `pages[].path`. rssync itself does
-not generate that derived RSS.
+A downstream generator can still resolve an item link against the corresponding
+`feeds[].final_url`, canonicalize it, and find the matching
+`pages[].source_url`. The optional generated Atom provides this mapping directly
+without requiring a publication origin in the rssync configuration.
 
 If an RSS fetch or parse fails, the previous original feed is retained. If a
 webpage refresh fails, a valid existing archive is reported with `cached`
 status; without a cache, it is reported as `failed`. RSS links are unaffected.
-Historical webpage files are not automatically deleted unless
+An existing Atom document is regenerated from the last usable RSS when possible,
+or retained unchanged if that RSS can no longer be parsed.
+Historical webpage and Atom files are not automatically deleted unless
 `archive-current-only` is enabled.

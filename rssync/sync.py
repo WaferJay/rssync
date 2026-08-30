@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
+from rssync.atom import build_atom_feed
 from rssync.config import AppConfig, FeedConfig
 from rssync.download_service import (
     DownloadConcurrency,
@@ -21,11 +22,13 @@ from rssync.downloaders.registry import DownloaderManager, DownloaderRegistry
 from rssync.manifests import load_feed_records, load_page_records
 from rssync.rss import RssDocument, rss_documents_equal
 from rssync.storage import (
+    atom_feed_local_url,
     manifest_path_relpath,
     rss_feed_local_url,
     rss_feed_relpath,
     webpage_manifest_path,
     webpage_relpath,
+    write_bytes_if_changed,
     write_json_atomic,
     write_rss_if_changed,
 )
@@ -41,6 +44,12 @@ RSS_FEED_NEW_PATH = ".new-feeds"
 RSS_FEED_PATH = "feeds"
 RSS_FEED_MANIFEST_PATH = "feeds.json"
 WEBPAGE_MANIFEST_PATH = "pages.json"
+ATOM_RECORD_FIELDS = {
+    "atom_path",
+    "atom_updated_at",
+    "atom_changed",
+    "atom_status",
+}
 
 
 @dataclass(slots=True)
@@ -293,6 +302,135 @@ class SyncEngine:
             return False
         return self.root.joinpath(*path.parts).is_file()
 
+    def _atom_document(
+        self,
+        outcome: FeedOutcome,
+        previous: Mapping[str, Any],
+    ) -> RssDocument | None:
+        """Return the current or last usable RSS document for Atom output."""
+
+        target = self.root / RSS_FEED_PATH / rss_feed_relpath(outcome.feed.url)
+        if not target.is_file():
+            return outcome.document
+        base_url = (
+            outcome.download.final_url
+            if outcome.download is not None
+            else previous.get("final_url", outcome.feed.url)
+        )
+        if not isinstance(base_url, str) or not base_url:
+            base_url = outcome.feed.url
+        try:
+            return RssDocument.parse(target.read_bytes(), base_url)
+        except Exception:
+            logger.warning(
+                "Retained RSS cannot be used for Atom output: %s",
+                outcome.feed.url,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _clear_atom_record(record: dict[str, Any]) -> None:
+        for field in ATOM_RECORD_FIELDS:
+            record.pop(field, None)
+
+    def _valid_recorded_atom(
+        self,
+        source_url: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        cleanup_target = self._atom_cleanup_target(source_url, record)
+        return cleanup_target is not None and cleanup_target[1].is_file()
+
+    def _write_atom_feeds(
+        self,
+        feed_outcomes: Mapping[int, FeedOutcome],
+        feed_records: list[dict[str, Any]],
+        previous_feeds: Mapping[str, Mapping[str, Any]],
+        page_records: Mapping[str, Mapping[str, Any]],
+        completed_at: int,
+    ) -> list[str]:
+        """Generate configured Atom feeds and return paths changed this run."""
+
+        records_by_url = {
+            record["source_url"]: record
+            for record in feed_records
+            if isinstance(record.get("source_url"), str)
+        }
+        atom_config = self.config.webpages.atom
+        available_pages = {
+            source_url
+            for source_url, record in page_records.items()
+            if self._valid_page_cache(record)
+        }
+        changed_paths: list[str] = []
+
+        for index, feed in enumerate(self.config.feeds):
+            record = records_by_url.get(feed.url)
+            if record is None:
+                continue
+            previous = previous_feeds.get(feed.url, {})
+            if atom_config is None or not feed.download_webpages:
+                self._clear_atom_record(record)
+                continue
+
+            document = self._atom_document(feed_outcomes[index], previous)
+            if document is None:
+                if self._valid_recorded_atom(feed.url, record):
+                    record["atom_changed"] = False
+                    record["atom_status"] = "retained"
+                else:
+                    self._clear_atom_record(record)
+                continue
+
+            relpath = rss_feed_relpath(feed.url)
+            public_path = atom_feed_local_url(atom_config.storage_path, relpath)
+            fallback_updated_at = record.get("updated_at")
+            if isinstance(fallback_updated_at, bool) or not isinstance(
+                fallback_updated_at, (int, float)
+            ):
+                fallback_updated_at = record.get("fetched_at")
+            if isinstance(fallback_updated_at, bool) or not isinstance(
+                fallback_updated_at, (int, float)
+            ):
+                fallback_updated_at = completed_at
+
+            data = build_atom_feed(
+                document,
+                source_feed_url=feed.url,
+                self_path=public_path,
+                page_records=page_records,
+                available_pages=available_pages,
+                missing_page_policy=atom_config.missing_page_policy,
+                fallback_updated_at=fallback_updated_at,
+            )
+            target = self.root / atom_config.storage_path / relpath
+            changed = write_bytes_if_changed(target, data)
+            prior_updated_at = previous.get("atom_updated_at")
+            has_prior_updated_at = not isinstance(
+                prior_updated_at, bool
+            ) and isinstance(prior_updated_at, (int, float))
+            record.update(
+                {
+                    "atom_path": public_path,
+                    "atom_updated_at": (
+                        completed_at
+                        if changed or not has_prior_updated_at
+                        else prior_updated_at
+                    ),
+                    "atom_changed": changed,
+                    "atom_status": (
+                        "ok"
+                        if feed_outcomes[index].document is not None
+                        else "retained"
+                    ),
+                }
+            )
+            if changed:
+                changed_paths.append(public_path)
+
+        return changed_paths
+
     def _update_pages(
         self,
         candidates: Mapping[str, PageTask],
@@ -464,10 +602,52 @@ class SyncEngine:
         target = self.root.joinpath(*relative.parts)
         return relative, target, managed_root
 
+    def _atom_cleanup_target(
+        self,
+        source_url: str,
+        record: Mapping[str, Any],
+    ) -> tuple[PurePosixPath, Path, Path] | None:
+        """Validate a manifest-owned Atom path and recover its storage root."""
+
+        path = record.get("atom_path")
+        if not isinstance(path, str):
+            return None
+        relative = manifest_path_relpath(path)
+        if relative is None:
+            logger.warning("Ignoring unsafe obsolete Atom path: %s", path)
+            return None
+
+        expected = PurePosixPath(rss_feed_relpath(source_url))
+        expected_length = len(expected.parts)
+        if (
+            len(relative.parts) <= expected_length
+            or relative.parts[-expected_length:] != expected.parts
+        ):
+            logger.warning(
+                "Ignoring obsolete Atom path that does not match its URL: %s",
+                path,
+            )
+            return None
+
+        storage_parts = relative.parts[:-expected_length]
+        if storage_parts[0] in {
+            RSS_FEED_PATH,
+            RSS_FEED_NEW_PATH,
+            RSS_FEED_MANIFEST_PATH,
+            WEBPAGE_MANIFEST_PATH,
+        }:
+            logger.warning("Ignoring Atom path inside a reserved path: %s", path)
+            return None
+        managed_root = self.root.joinpath(*storage_parts)
+        target = self.root.joinpath(*relative.parts)
+        return relative, target, managed_root
+
     def _cleanup_obsolete_archives(
         self,
         obsolete_feeds: Mapping[str, Mapping[str, Any]],
+        obsolete_atoms: Mapping[str, Mapping[str, Any]],
         obsolete_pages: Mapping[str, Mapping[str, Any]],
+        current_feeds: Mapping[str, Mapping[str, Any]],
         current_pages: Mapping[str, Mapping[str, Any]],
     ) -> None:
         """Delete only obsolete files whose ownership is proven by old manifests."""
@@ -497,6 +677,20 @@ class SyncEngine:
                     managed_root.joinpath(*relpath.parts),
                     managed_root,
                 )
+
+        current_atom_paths: set[PurePosixPath] = set()
+        for source_url, record in current_feeds.items():
+            cleanup_target = self._atom_cleanup_target(source_url, record)
+            if cleanup_target is not None:
+                current_atom_paths.add(cleanup_target[0])
+        for source_url, record in obsolete_atoms.items():
+            cleanup_target = self._atom_cleanup_target(source_url, record)
+            if cleanup_target is None:
+                continue
+            relative, target, managed_root = cleanup_target
+            if relative in current_atom_paths:
+                continue
+            self._remove_archive_file(target, managed_root)
 
         current_page_paths: set[PurePosixPath] = set()
         for source_url, record in current_pages.items():
@@ -606,27 +800,61 @@ class SyncEngine:
                 if changed_path is not None:
                     changed_feeds.append(changed_path)
 
+            completed_at = int(self.clock())
+            changed_atoms = self._write_atom_feeds(
+                feed_outcomes,
+                feed_records,
+                previous_feeds,
+                page_records,
+                completed_at,
+            )
+
             if self.config.archive_current_only:
+                current_feed_records = {
+                    record["source_url"]: record
+                    for record in feed_records
+                    if isinstance(record.get("source_url"), str)
+                }
                 configured_feed_urls = {feed.url for feed in self.config.feeds}
+                atom_enabled_urls = {
+                    feed.url
+                    for feed in self.config.feeds
+                    if self.config.webpages.atom is not None
+                    and feed.download_webpages
+                }
                 obsolete_feeds = {
                     url: record
                     for url, record in previous_feeds.items()
                     if url not in configured_feed_urls
                 }
+                obsolete_atoms = {
+                    url: record
+                    for url, record in previous_feeds.items()
+                    if isinstance(record.get("atom_path"), str)
+                    and (
+                        url not in atom_enabled_urls
+                        or (
+                            url in current_feed_records
+                            and record.get("atom_path")
+                            != current_feed_records[url].get("atom_path")
+                        )
+                    )
+                }
                 self._cleanup_obsolete_archives(
                     obsolete_feeds,
+                    obsolete_atoms,
                     obsolete_pages,
+                    current_feed_records,
                     page_records,
                 )
 
-            completed_at = int(self.clock())
-            feed_manifest = {
-                "feeds": feed_records,
-                "sync": {
-                    "completed_at": completed_at,
-                    "changed": changed_feeds,
-                },
+            feed_sync = {
+                "completed_at": completed_at,
+                "changed": changed_feeds,
             }
+            if self.config.webpages.atom is not None:
+                feed_sync["changed_atoms"] = changed_atoms
+            feed_manifest = {"feeds": feed_records, "sync": feed_sync}
             write_json_atomic(self.root / RSS_FEED_MANIFEST_PATH, feed_manifest)
 
             page_manifest = {

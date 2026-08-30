@@ -64,11 +64,20 @@ class RssConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AtomConfig:
+    """Output settings for Atom feeds that point at archived webpages."""
+
+    storage_path: str = "atoms"
+    missing_page_policy: str = "ignore"
+
+
+@dataclass(frozen=True, slots=True)
 class WebpageConfig:
-    """Storage and refresh settings for archived webpages."""
+    """Storage, refresh, and derived-feed settings for archived webpages."""
 
     storage_path: str = "pages"
     refresh_policy: str = "always"
+    atom: AtomConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +403,7 @@ def _parse_webpages(
     refresh_registry: WebpageRefreshRegistry,
 ) -> WebpageConfig:
     raw = {} if data is None else _mapping(data, "webpages")
-    _only_keys(raw, {"storage-path", "refresh-policy"}, "webpages")
+    _only_keys(raw, {"storage-path", "refresh-policy", "atom"}, "webpages")
 
     storage_path = raw.get("storage-path", "pages")
     if not isinstance(storage_path, str) or not storage_path:
@@ -402,6 +411,49 @@ def _parse_webpages(
     path = PurePath(storage_path)
     if path.is_absolute() or ".." in path.parts:
         raise ConfigError("webpages.storage-path must be a safe relative path")
+
+    atom = None
+    if "atom" in raw:
+        atom_raw = _mapping(raw["atom"], "webpages.atom")
+        _only_keys(
+            atom_raw,
+            {"storage-path", "missing-page-policy"},
+            "webpages.atom",
+        )
+        atom_storage_path = atom_raw.get("storage-path", "atoms")
+        if not isinstance(atom_storage_path, str) or not atom_storage_path:
+            raise ConfigError(
+                "webpages.atom.storage-path must be a non-empty string"
+            )
+        atom_path = PurePath(atom_storage_path)
+        if (
+            atom_path.is_absolute()
+            or ".." in atom_path.parts
+            or not atom_path.parts
+        ):
+            raise ConfigError(
+                "webpages.atom.storage-path must be a safe relative path"
+            )
+        if atom_path.parts[0] in {
+            "feeds",
+            ".new-feeds",
+            "feeds.json",
+            "pages.json",
+        }:
+            raise ConfigError(
+                "webpages.atom.storage-path must not overlap managed RSS "
+                "or manifest paths"
+            )
+        missing_page_policy = atom_raw.get("missing-page-policy", "ignore")
+        if missing_page_policy not in {"ignore", "source-url"}:
+            raise ConfigError(
+                "webpages.atom.missing-page-policy must be "
+                "'ignore' or 'source-url'"
+            )
+        atom = AtomConfig(
+            storage_path=atom_storage_path,
+            missing_page_policy=missing_page_policy,
+        )
     return WebpageConfig(
         storage_path=storage_path,
         refresh_policy=_parse_refresh_policy(
@@ -409,6 +461,7 @@ def _parse_webpages(
             "webpages.refresh-policy",
             refresh_registry,
         ),
+        atom=atom,
     )
 
 

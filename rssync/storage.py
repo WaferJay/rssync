@@ -56,6 +56,15 @@ def rss_feed_local_url(relpath: str) -> str:
     return root_relative_manifest_path("feeds", relpath.replace(os.sep, "/"))
 
 
+def atom_feed_local_url(storage_path: str, relpath: str) -> str:
+    """Return the root-relative path of a derived Atom feed."""
+
+    return root_relative_manifest_path(
+        storage_path,
+        relpath.replace(os.sep, "/"),
+    )
+
+
 def unique_feed_urls(feed_urls: list[str]) -> list[str]:
     """Return URLs in first-seen order, kept for API compatibility."""
 
@@ -163,6 +172,21 @@ def write_rss_if_changed(
         if target.is_file() and is_duplicate_rss_file(temporary, target, ignore_tags):
             temporary.unlink(missing_ok=True)
             return False
+        os.replace(temporary, target)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_bytes_if_changed(path: str | os.PathLike[str], data: bytes) -> bool:
+    """Atomically write bytes only when the target content changed."""
+
+    target = Path(path)
+    if target.is_file() and target.read_bytes() == data:
+        return False
+    temporary = temporary_sibling(target)
+    try:
+        temporary.write_bytes(data)
         os.replace(temporary, target)
         return True
     finally:

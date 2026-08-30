@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import xml.etree.ElementTree as ET
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -112,11 +112,96 @@ class RssLink:
 
 
 @dataclass(frozen=True, slots=True)
+class RssCategory:
+    """One RSS item category and its optional taxonomy domain."""
+
+    term: str
+    domain: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RssEntry:
+    """RSS item metadata used for derived Atom entries."""
+
+    links: tuple[RssLink, ...]
+    title: str | None = None
+    guid: str | None = None
+    pub_date: str | None = None
+    description: str | None = None
+    author: str | None = None
+    categories: tuple[RssCategory, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RssChannel:
+    """RSS channel metadata used for a derived Atom feed."""
+
+    title: str | None = None
+    description: str | None = None
+    link: str | None = None
+    pub_date: str | None = None
+    last_build_date: str | None = None
+    author: str | None = None
+
+
+def _direct_children(element: ET.Element, name: str) -> list[ET.Element]:
+    expected = name.lower()
+    return [
+        child
+        for child in element
+        if _local_name(child.tag).lower() == expected
+    ]
+
+
+def _plain_text(element: ET.Element | None) -> str | None:
+    if element is None:
+        return None
+    value = "".join(element.itertext()).strip()
+    return value or None
+
+
+def _inner_xml(element: ET.Element | None) -> str | None:
+    if element is None:
+        return None
+    if not list(element):
+        value = (element.text or "").strip()
+        return value or None
+    parts = [element.text or ""]
+    parts.extend(ET.tostring(child, encoding="unicode") for child in element)
+    value = "".join(parts).strip()
+    return value or None
+
+
+def _first_child(element: ET.Element, name: str) -> ET.Element | None:
+    children = _direct_children(element, name)
+    return children[0] if children else None
+
+
+def _http_link(value: str | None, base_url: str) -> RssLink | None:
+    if value is None:
+        return None
+    original = value.strip()
+    if not original:
+        return None
+    resolved = urljoin(base_url, original)
+    canonical = canonicalize_http_url(resolved)
+    if canonical is None:
+        return None
+    return RssLink(
+        original=original,
+        resolved_url=resolved,
+        canonical_url=canonical,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RssDocument:
     """A validated RSS document retaining its exact source bytes."""
 
     source: bytes
     links: tuple[RssLink, ...]
+    channel: RssChannel = field(default_factory=RssChannel)
+    entries: tuple[RssEntry, ...] = ()
 
     @classmethod
     def parse(cls, source: bytes, base_url: str) -> RssDocument:
@@ -129,25 +214,71 @@ class RssDocument:
         if _local_name(root.tag).lower() != "rss":
             raise RssParseError("document root is not an RSS element")
 
+        channel_element = next(
+            (
+                child
+                for child in root
+                if _local_name(child.tag).lower() == "channel"
+            ),
+            root,
+        )
+        channel_link = _http_link(
+            _plain_text(_first_child(channel_element, "link")),
+            base_url,
+        )
+        channel = RssChannel(
+            title=_plain_text(_first_child(channel_element, "title")),
+            description=_inner_xml(
+                _first_child(channel_element, "description")
+            ),
+            link=channel_link.resolved_url if channel_link is not None else None,
+            pub_date=_plain_text(_first_child(channel_element, "pubDate")),
+            last_build_date=_plain_text(
+                _first_child(channel_element, "lastBuildDate")
+            ),
+            author=(
+                _plain_text(_first_child(channel_element, "managingEditor"))
+                or _plain_text(_first_child(channel_element, "webMaster"))
+            ),
+        )
+
         links: list[RssLink] = []
+        entries: list[RssEntry] = []
         for item in root.iter():
             if _local_name(item.tag).lower() != "item":
                 continue
+            item_links: list[RssLink] = []
             for child in item:
-                if _local_name(child.tag).lower() != "link" or not child.text:
+                if _local_name(child.tag).lower() != "link":
                     continue
-                original = child.text.strip()
-                if not original:
-                    continue
-                resolved = urljoin(base_url, original)
-                canonical = canonicalize_http_url(resolved)
-                if canonical is None:
-                    continue
-                links.append(
-                    RssLink(
-                        original=original,
-                        resolved_url=resolved,
-                        canonical_url=canonical,
-                    )
+                link = _http_link(_plain_text(child), base_url)
+                if link is not None:
+                    item_links.append(link)
+                    links.append(link)
+            categories = tuple(
+                RssCategory(
+                    term=term,
+                    domain=(child.get("domain") or "").strip() or None,
                 )
-        return cls(source=source, links=tuple(links))
+                for child in _direct_children(item, "category")
+                if (term := _plain_text(child)) is not None
+            )
+            entries.append(
+                RssEntry(
+                    links=tuple(item_links),
+                    title=_plain_text(_first_child(item, "title")),
+                    guid=_plain_text(_first_child(item, "guid")),
+                    pub_date=_plain_text(_first_child(item, "pubDate")),
+                    description=_inner_xml(
+                        _first_child(item, "description")
+                    ),
+                    author=_plain_text(_first_child(item, "author")),
+                    categories=categories,
+                )
+            )
+        return cls(
+            source=source,
+            links=tuple(links),
+            channel=channel,
+            entries=tuple(entries),
+        )

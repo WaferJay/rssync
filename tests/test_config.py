@@ -19,6 +19,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.feeds[0].webpage_downloader, "default")
         self.assertFalse(config.feeds[0].download_webpages)
         self.assertEqual(config.webpages.refresh_policy, "always")
+        self.assertIsNone(config.webpages.atom)
         self.assertEqual(config.feeds[0].webpage_refresh_policy, "always")
         self.assertFalse(config.archive_current_only)
         self.assertEqual(config.downloaders["default"].backend, "httpx")
@@ -128,6 +129,66 @@ class ConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(config.webpages.storage_path, "pages")
+
+    def test_atom_output_is_enabled_by_its_configuration_object(self):
+        config = parse_config(
+            {
+                "webpages": {"atom": {}},
+                "feeds": [
+                    {
+                        "url": "https://example.com/rss.xml",
+                        "download-webpages": True,
+                    }
+                ],
+            }
+        )
+
+        self.assertIsNotNone(config.webpages.atom)
+        self.assertEqual(config.webpages.atom.storage_path, "atoms")
+        self.assertEqual(config.webpages.atom.missing_page_policy, "ignore")
+
+        configured = parse_config(
+            {
+                "webpages": {
+                    "atom": {
+                        "storage-path": "public/feeds",
+                        "missing-page-policy": "source-url",
+                    }
+                },
+                "feeds": [{"url": "https://example.com/rss.xml"}],
+            }
+        )
+
+        self.assertEqual(configured.webpages.atom.storage_path, "public/feeds")
+        self.assertEqual(
+            configured.webpages.atom.missing_page_policy,
+            "source-url",
+        )
+
+    def test_invalid_atom_settings_are_rejected(self):
+        invalid_atom_values = [
+            None,
+            {"storage-path": ""},
+            {"storage-path": "/atoms"},
+            {"storage-path": "../atoms"},
+            {"storage-path": "."},
+            {"storage-path": "feeds"},
+            {"storage-path": "feeds/atoms"},
+            {"storage-path": ".new-feeds"},
+            {"storage-path": ".new-feeds/atoms"},
+            {"storage-path": "feeds.json"},
+            {"storage-path": "pages.json/atoms"},
+            {"missing-page-policy": "local-path"},
+            {"unknown": True},
+        ]
+        for atom in invalid_atom_values:
+            with self.subTest(atom=atom), self.assertRaises(ConfigError):
+                parse_config(
+                    {
+                        "webpages": {"atom": atom},
+                        "feeds": [{"url": "https://example.com/rss.xml"}],
+                    }
+                )
 
     def test_feed_refresh_policy_overrides_the_global_policy(self):
         config = parse_config(
