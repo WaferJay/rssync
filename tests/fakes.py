@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Iterable, Mapping
+import asyncio
+from collections.abc import AsyncIterable, Mapping
 from dataclasses import dataclass
-from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -42,19 +41,19 @@ class FakeResponse:
         self._factory = factory
         self._label = label
 
-    def iter_bytes(self) -> Iterable[bytes]:
+    async def iter_bytes(self) -> AsyncIterable[bytes]:
         hostname = urlsplit(self.requested_url).hostname or ""
         self._factory.enter(self._label, hostname)
         try:
             if self._reply.delay:
-                time.sleep(self._reply.delay)
+                await asyncio.sleep(self._reply.delay)
             midpoint = len(self._reply.body) // 2
             yield self._reply.body[:midpoint]
             yield self._reply.body[midpoint:]
         finally:
             self._factory.exit(self._label, hostname)
 
-    def close(self) -> None:
+    async def close(self) -> None:
         return None
 
 
@@ -81,23 +80,24 @@ class FakeDownloader:
             headers={},
             metadata={
                 "label": self.options.get("label", "default"),
-                "use_session": False,
                 "user_agent": "fake-agent",
                 "user_agent_strategy": "test",
             },
         )
 
-    def open_attempt(self, request: PreparedDownloadRequest) -> FakeResponse:
+    async def open_attempt(
+        self, request: PreparedDownloadRequest
+    ) -> FakeResponse:
         label = str(self.options.get("label", "default"))
-        with self.factory.lock:
-            self.factory.calls.append((request.resource_kind, request.url, label))
+        self.factory.calls.append((request.resource_kind, request.url, label))
         reply = self.factory.replies[request.url]
         return FakeResponse(request.url, reply, self.factory, label)
 
     def is_retryable_exception(self, error: BaseException) -> bool:
         return isinstance(error, OSError)
 
-    def close(self) -> None:
+    async def close(self) -> None:
+        self.factory.closed += 1
         return None
 
 
@@ -105,7 +105,8 @@ class FakeBackendFactory:
     def __init__(self, replies: Mapping[str, FakeReply]) -> None:
         self.replies = dict(replies)
         self.calls: list[tuple[str, str, str]] = []
-        self.lock = Lock()
+        self.created = 0
+        self.closed = 0
         self.active = 0
         self.max_active = 0
         self.active_by_label: dict[str, int] = {}
@@ -114,25 +115,23 @@ class FakeBackendFactory:
         self.max_active_by_hostname: dict[str, int] = {}
 
     def enter(self, label: str, hostname: str) -> None:
-        with self.lock:
-            self.active += 1
-            self.max_active = max(self.max_active, self.active)
-            active = self.active_by_label.get(label, 0) + 1
-            self.active_by_label[label] = active
-            self.max_active_by_label[label] = max(
-                self.max_active_by_label.get(label, 0), active
-            )
-            domain_active = self.active_by_hostname.get(hostname, 0) + 1
-            self.active_by_hostname[hostname] = domain_active
-            self.max_active_by_hostname[hostname] = max(
-                self.max_active_by_hostname.get(hostname, 0), domain_active
-            )
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        active = self.active_by_label.get(label, 0) + 1
+        self.active_by_label[label] = active
+        self.max_active_by_label[label] = max(
+            self.max_active_by_label.get(label, 0), active
+        )
+        domain_active = self.active_by_hostname.get(hostname, 0) + 1
+        self.active_by_hostname[hostname] = domain_active
+        self.max_active_by_hostname[hostname] = max(
+            self.max_active_by_hostname.get(hostname, 0), domain_active
+        )
 
     def exit(self, label: str, hostname: str) -> None:
-        with self.lock:
-            self.active -= 1
-            self.active_by_label[label] -= 1
-            self.active_by_hostname[hostname] -= 1
+        self.active -= 1
+        self.active_by_label[label] -= 1
+        self.active_by_hostname[hostname] -= 1
 
     def validate_options(self, options: Mapping[str, Any]) -> Mapping[str, Any]:
         return dict(options)
@@ -143,4 +142,5 @@ class FakeBackendFactory:
         runtime: DownloaderRuntimeContext,
     ) -> FakeDownloader:
         del runtime
+        self.created += 1
         return FakeDownloader(self, options)

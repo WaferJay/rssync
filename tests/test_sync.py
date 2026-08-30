@@ -30,8 +30,8 @@ class NeverRefreshStrategy:
         return False
 
 
-class SyncEngineTest(unittest.TestCase):
-    def test_webpages_are_disabled_by_default(self):
+class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_webpages_are_disabled_by_default(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         feed_body = (
@@ -48,7 +48,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -60,7 +60,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(factory.calls, [("rss", feed_url, "default")])
             self.assertFalse(Path(directory, "pages.json").exists())
 
-    def test_enabled_webpage_and_rss_are_both_stored_raw(self):
+    async def test_enabled_webpage_and_rss_are_both_stored_raw(self):
         feed_url = "https://example.com/news/feed.xml"
         page_url = "https://example.com/article?id=1"
         page_body = b"\xff<html><body>raw bytes</body></html>"
@@ -85,7 +85,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            manifests = SyncEngine(
+            manifests = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -112,7 +112,7 @@ class SyncEngineTest(unittest.TestCase):
                 ],
             )
 
-    def test_on_rss_change_skips_when_only_ignored_tags_change(self):
+    async def test_on_rss_change_skips_when_only_ignored_tags_change(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         first_rss = (
@@ -131,7 +131,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -150,7 +150,7 @@ class SyncEngineTest(unittest.TestCase):
             )
             second_factory = FakeBackendFactory({feed_url: FakeReply(second_rss)})
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(second_factory),
@@ -171,7 +171,7 @@ class SyncEngineTest(unittest.TestCase):
                 "on-rss-change",
             )
 
-    def test_on_rss_change_refreshes_after_a_meaningful_change(self):
+    async def test_on_rss_change_refreshes_after_a_meaningful_change(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         first_rss = rss_with_links(page_url)
@@ -185,7 +185,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -205,7 +205,7 @@ class SyncEngineTest(unittest.TestCase):
                 }
             )
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(second_factory),
@@ -218,7 +218,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(page_record["updated_at"], 200)
             self.assertEqual(page_record["fetched_at"], 200)
 
-    def test_missing_only_preserves_cache_and_repairs_invalid_cache(self):
+    async def test_missing_only_preserves_cache_and_repairs_invalid_cache(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         first_rss = rss_with_links(page_url)
@@ -232,7 +232,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -251,7 +251,7 @@ class SyncEngineTest(unittest.TestCase):
             )
             second_factory = FakeBackendFactory({feed_url: FakeReply(changed_rss)})
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(second_factory),
@@ -269,7 +269,7 @@ class SyncEngineTest(unittest.TestCase):
                 }
             )
 
-            repaired = SyncEngine(
+            repaired = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(repair_factory),
@@ -294,7 +294,7 @@ class SyncEngineTest(unittest.TestCase):
                 }
             )
 
-            reindexed = SyncEngine(
+            reindexed = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(reindex_factory),
@@ -306,7 +306,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(reindexed["pages"]["pages"][0]["status"], "ok")
             self.assertEqual(reindexed["pages"]["pages"][0]["fetched_at"], 400)
 
-    def test_shared_page_uses_first_feed_whose_policy_requests_refresh(self):
+    async def test_shared_page_uses_first_feed_whose_policy_requests_refresh(self):
         first_feed = "https://one.example/feed.xml"
         second_feed = "https://two.example/feed.xml"
         page_url = "https://shared.example/article"
@@ -344,7 +344,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -365,7 +365,7 @@ class SyncEngineTest(unittest.TestCase):
                 }
             )
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(second_factory),
@@ -378,7 +378,7 @@ class SyncEngineTest(unittest.TestCase):
                 second_feed,
             )
 
-    def test_custom_refresh_strategy_is_used_without_engine_changes(self):
+    async def test_custom_refresh_strategy_is_used_without_engine_changes(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         rss = rss_with_links(page_url)
@@ -394,7 +394,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -409,7 +409,7 @@ class SyncEngineTest(unittest.TestCase):
             ).run()
             second_factory = FakeBackendFactory({feed_url: FakeReply(rss)})
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(second_factory),
@@ -420,7 +420,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(second["pages"]["pages"][0]["status"], "skipped")
             self.assertEqual(second["pages"]["pages"][0]["skip_reason"], "never")
 
-    def test_first_enabled_feed_selects_the_page_preset(self):
+    async def test_first_enabled_feed_selects_the_page_preset(self):
         first_feed = "https://one.example/feed.xml"
         second_feed = "https://two.example/feed.xml"
         page_url = "https://shared.example/article"
@@ -465,7 +465,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -474,7 +474,7 @@ class SyncEngineTest(unittest.TestCase):
         page_calls = [call for call in factory.calls if call[0] == "webpage"]
         self.assertEqual(page_calls, [("webpage", page_url, "first")])
 
-    def test_rss_stage_honors_global_and_cross_preset_domain_concurrency(self):
+    async def test_rss_stage_honors_global_and_cross_preset_domain_concurrency(self):
         feeds = [
             (f"https://{hostname}/feed-{index}.xml", index)
             for index in range(3)
@@ -512,7 +512,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -533,7 +533,7 @@ class SyncEngineTest(unittest.TestCase):
         self.assertEqual(labels_by_hostname["example.com"], {"one", "two"})
         self.assertEqual(labels_by_hostname["example.org"], {"one", "two"})
 
-    def test_rss_stage_honors_global_concurrency_across_presets(self):
+    async def test_rss_stage_honors_global_concurrency_across_presets(self):
         feed_urls = [
             f"https://example.net/feed-{index}.xml" for index in range(6)
         ]
@@ -568,7 +568,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -577,7 +577,7 @@ class SyncEngineTest(unittest.TestCase):
         self.assertEqual(factory.max_active, 2)
         self.assertEqual(set(factory.max_active_by_label), {"one", "two"})
 
-    def test_webpage_stage_does_not_starve_later_hostnames(self):
+    async def test_webpage_stage_does_not_starve_later_hostnames(self):
         hostnames = [f"site-{index}.example" for index in range(8)]
         feed_urls = [f"https://{hostname}/rss.xml" for hostname in hostnames]
         page_urls = {
@@ -605,7 +605,7 @@ class SyncEngineTest(unittest.TestCase):
                 "concurrency": {
                     "rss-downloads": 8,
                     "webpage-downloads": 8,
-                    "per-domain-downloads": 2,
+                    "per-domain-downloads": 1,
                 },
                 "downloaders": {
                     "default": {
@@ -629,7 +629,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -644,9 +644,9 @@ class SyncEngineTest(unittest.TestCase):
         )
         self.assertEqual(factory.max_active_by_label["pages"], 8)
         for hostname in hostnames:
-            self.assertLessEqual(factory.max_active_by_hostname[hostname], 2)
+            self.assertEqual(factory.max_active_by_hostname[hostname], 1)
 
-    def test_failed_webpage_refresh_uses_existing_cache(self):
+    async def test_failed_webpage_refresh_uses_existing_cache(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/page"
         rss = (
@@ -668,7 +668,7 @@ class SyncEngineTest(unittest.TestCase):
                     page_url: FakeReply(b"<html>cached</html>", "text/html"),
                 }
             )
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(first_factory),
@@ -690,7 +690,7 @@ class SyncEngineTest(unittest.TestCase):
                     page_url: FakeReply(b"unavailable", "text/html", status=500),
                 }
             )
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(second_factory),
@@ -704,7 +704,7 @@ class SyncEngineTest(unittest.TestCase):
                 Path(directory, "feeds/example.com/feed.xml").read_bytes(), rss
             )
 
-    def test_failed_relative_webpage_does_not_modify_rss(self):
+    async def test_failed_relative_webpage_does_not_modify_rss(self):
         feed_url = "https://example.com/news/feed.xml"
         page_url = "https://example.com/article"
         rss = (
@@ -726,7 +726,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            manifests = SyncEngine(
+            manifests = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(factory),
@@ -736,7 +736,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(archived_rss.read_bytes(), rss)
             self.assertEqual(manifests["pages"]["pages"][0]["status"], "failed")
 
-    def test_current_only_removes_feed_and_its_unreferenced_page(self):
+    async def test_current_only_removes_feed_and_its_unreferenced_page(self):
         removed_feed = "https://removed.example/feed.xml"
         retained_feed = "https://retained.example/feed.xml"
         page_url = "https://pages.example/old/article"
@@ -759,7 +759,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 first_config,
                 root=directory,
                 registry=registry_with(
@@ -784,7 +784,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertTrue(removed_rss.is_file())
             self.assertTrue(removed_download.is_file())
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 second_config,
                 root=directory,
                 registry=registry_with(
@@ -802,7 +802,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertFalse(removed_download.exists())
             self.assertFalse(removed_download.parent.exists())
 
-    def test_current_only_removes_page_missing_from_latest_rss(self):
+    async def test_current_only_removes_page_missing_from_latest_rss(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/articles/old"
         config = parse_config(
@@ -815,7 +815,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -832,7 +832,7 @@ class SyncEngineTest(unittest.TestCase):
                 first["pages"]["pages"][0]["path"].removeprefix("/"),
             )
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -843,7 +843,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(second["pages"]["pages"], [])
             self.assertFalse(page_path.exists())
 
-    def test_current_only_preserves_last_pages_when_rss_parse_fails(self):
+    async def test_current_only_preserves_last_pages_when_rss_parse_fails(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/current"
         config = parse_config(
@@ -855,7 +855,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -875,7 +875,7 @@ class SyncEngineTest(unittest.TestCase):
                 {feed_url: FakeReply(b"not valid RSS")}
             )
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(failed_factory),
@@ -886,7 +886,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(failed_factory.calls, [("rss", feed_url, "default")])
             self.assertEqual(second["feeds"]["feeds"][0]["status"], "retained")
 
-    def test_current_only_skips_page_cleanup_when_retained_rss_is_invalid(self):
+    async def test_current_only_skips_page_cleanup_when_retained_rss_is_invalid(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/current"
         config = parse_config(
@@ -898,7 +898,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -917,7 +917,7 @@ class SyncEngineTest(unittest.TestCase):
             page_record = first["pages"]["pages"][0]
             page_path = Path(directory, page_record["path"].removeprefix("/"))
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -928,7 +928,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(second["pages"]["pages"], [page_record])
             self.assertTrue(page_path.is_file())
 
-    def test_current_only_keeps_a_page_still_referenced_by_another_feed(self):
+    async def test_current_only_keeps_a_page_still_referenced_by_another_feed(self):
         first_feed = "https://one.example/feed.xml"
         second_feed = "https://two.example/feed.xml"
         page_url = "https://shared.example/article"
@@ -944,7 +944,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -957,7 +957,7 @@ class SyncEngineTest(unittest.TestCase):
                     )
                 ),
             ).run()
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -978,7 +978,7 @@ class SyncEngineTest(unittest.TestCase):
             )
             self.assertTrue(page_path.is_file())
 
-    def test_current_only_removes_page_from_previous_storage_path(self):
+    async def test_current_only_removes_page_from_previous_storage_path(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
 
@@ -993,7 +993,7 @@ class SyncEngineTest(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config("old-pages"),
                 root=directory,
                 registry=registry_with(
@@ -1010,7 +1010,7 @@ class SyncEngineTest(unittest.TestCase):
                 first["pages"]["pages"][0]["path"].removeprefix("/"),
             )
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config("new-pages"),
                 root=directory,
                 registry=registry_with(
@@ -1031,7 +1031,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertFalse(old_path.parent.exists())
             self.assertTrue(new_path.is_file())
 
-    def test_skipped_page_stays_in_its_recorded_storage_path(self):
+    async def test_skipped_page_stays_in_its_recorded_storage_path(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         rss = rss_with_links(page_url)
@@ -1050,7 +1050,7 @@ class SyncEngineTest(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config("old-pages"),
                 root=directory,
                 registry=registry_with(
@@ -1066,7 +1066,7 @@ class SyncEngineTest(unittest.TestCase):
             old_path = Path(directory, old_record["path"].removeprefix("/"))
             second_factory = FakeBackendFactory({feed_url: FakeReply(rss)})
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config("new-pages"),
                 root=directory,
                 registry=registry_with(second_factory),
@@ -1079,7 +1079,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertTrue(old_path.is_file())
             self.assertFalse(Path(directory, "new-pages").exists())
 
-    def test_current_only_does_not_delete_a_manifest_path_mismatched_to_url(self):
+    async def test_current_only_does_not_delete_a_manifest_path_mismatched_to_url(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/article"
         config = parse_config(
@@ -1091,7 +1091,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1115,7 +1115,7 @@ class SyncEngineTest(unittest.TestCase):
                 json.dumps(manifest), encoding="utf-8"
             )
 
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1127,7 +1127,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
             self.assertTrue(original_page.is_file())
 
-    def test_current_only_does_not_sweep_unrecorded_feed_files(self):
+    async def test_current_only_does_not_sweep_unrecorded_feed_files(self):
         feed_url = "https://current.example/feed.xml"
         config = parse_config(
             {
@@ -1142,7 +1142,7 @@ class SyncEngineTest(unittest.TestCase):
             unrecorded.parent.mkdir(parents=True)
             unrecorded.write_bytes(b"not owned by the current manifest")
 
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1154,7 +1154,7 @@ class SyncEngineTest(unittest.TestCase):
                 unrecorded.read_bytes(), b"not owned by the current manifest"
             )
 
-    def test_default_archive_mode_keeps_pages_missing_from_latest_rss(self):
+    async def test_default_archive_mode_keeps_pages_missing_from_latest_rss(self):
         feed_url = "https://example.com/feed.xml"
         page_url = "https://example.com/history"
         config = parse_config(
@@ -1165,7 +1165,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1181,7 +1181,7 @@ class SyncEngineTest(unittest.TestCase):
                 directory,
                 first["pages"]["pages"][0]["path"].removeprefix("/"),
             )
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1192,7 +1192,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(len(second["pages"]["pages"]), 1)
             self.assertTrue(page_path.is_file())
 
-    def test_default_change_detection_ignores_last_build_date(self):
+    async def test_default_change_detection_ignores_last_build_date(self):
         feed_url = "https://example.com/feed.xml"
         first_body = (
             b'<rss version="2.0"><channel><lastBuildDate>one</lastBuildDate>'
@@ -1207,7 +1207,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            first = SyncEngine(
+            first = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1215,7 +1215,7 @@ class SyncEngineTest(unittest.TestCase):
                 ),
                 clock=lambda: 100,
             ).run()
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1231,7 +1231,7 @@ class SyncEngineTest(unittest.TestCase):
             self.assertEqual(second["feeds"]["feeds"][0]["updated_at"], 100)
             self.assertEqual(second["feeds"]["feeds"][0]["fetched_at"], 200)
 
-    def test_feed_override_can_enable_exact_byte_detection(self):
+    async def test_feed_override_can_enable_exact_byte_detection(self):
         feed_url = "https://example.com/feed.xml"
         first_body = (
             b'<rss version="2.0"><channel><lastBuildDate>one</lastBuildDate>'
@@ -1251,7 +1251,7 @@ class SyncEngineTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            SyncEngine(
+            await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(
@@ -1259,7 +1259,7 @@ class SyncEngineTest(unittest.TestCase):
                 ),
                 clock=lambda: 100,
             ).run()
-            second = SyncEngine(
+            second = await SyncEngine(
                 config,
                 root=directory,
                 registry=registry_with(

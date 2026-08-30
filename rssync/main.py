@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import sys
@@ -36,7 +37,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def fetch_rss_xml(url: str, basepath: str = ".") -> tuple[str, str]:
+async def fetch_rss_xml(url: str, basepath: str = ".") -> tuple[str, str]:
     """Fetch one RSS file using the implicit default downloader preset."""
 
     config = parse_config({"feeds": [{"url": url}]})
@@ -54,18 +55,18 @@ def fetch_rss_xml(url: str, basepath: str = ".") -> tuple[str, str]:
         ),
     )
     try:
-        service.download(
+        await service.download(
             url=url,
             resource_kind="rss",
             preset_name="default",
             target_path=target_path,
         )
     finally:
-        manager.close()
+        await manager.close()
     return str(target_path), relpath
 
 
-def rss_update_worker(
+async def rss_update_worker(
     url: str, temp_dir: str, target_dir: str
 ) -> dict[str, Any] | None:
     """Compatibility wrapper for the historical single-feed worker."""
@@ -73,7 +74,7 @@ def rss_update_worker(
     relpath = rss_feed_relpath(url)
     target_file = Path(target_dir, relpath)
     try:
-        temp_file, _ = fetch_rss_xml(url, temp_dir)
+        temp_file, _ = await fetch_rss_xml(url, temp_dir)
         changed = not (
             target_file.exists() and is_duplicate_rss_file(temp_file, target_file)
         )
@@ -100,7 +101,11 @@ def main(args: list[str] | None = None) -> None:
         Path("rssync-config.json") if len(arguments) <= 1 else Path(arguments[1])
     )
     config = load_config(config_file)
-    SyncEngine(config).run()
+
+    async def run() -> None:
+        await SyncEngine(config).run()
+
+    asyncio.run(run())
 
 
 __all__ = [

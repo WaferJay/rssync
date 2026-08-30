@@ -1,15 +1,15 @@
-"""The built-in downloader implemented with :mod:`requests`."""
+"""The built-in asynchronous downloader implemented with :mod:`httpx`."""
 
 from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-import requests
+import httpx
 from fake_useragent import UserAgent
 
 from rssync.config import DEFAULT_USER_AGENT
@@ -24,28 +24,28 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_HEADERS = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1'
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 
 @dataclass(frozen=True, slots=True)
 class UserAgentOptions:
-    """User-Agent selection settings for the requests backend."""
+    """User-Agent selection settings for the HTTPX backend."""
 
     strategy: str = "per-run"
     fallback: str = DEFAULT_USER_AGENT
 
 
 @dataclass(frozen=True, slots=True)
-class RequestsOptions:
-    """Validated options for one requests downloader preset."""
+class HttpxOptions:
+    """Validated options for one HTTPX downloader preset."""
 
-    use_session: bool
+    http2: bool
     timeout: float
     retries: int
     backoff_factor: float
@@ -63,11 +63,11 @@ def _number(value: object, location: str, *, minimum: float) -> float:
     return result
 
 
-def parse_requests_options(options: Mapping[str, Any]) -> RequestsOptions:
-    """Validate requests-specific preset options."""
+def parse_httpx_options(options: Mapping[str, Any]) -> HttpxOptions:
+    """Validate HTTPX-specific preset options."""
 
     allowed = {
-        "use-session",
+        "http2",
         "timeout",
         "retries",
         "backoff-factor",
@@ -77,35 +77,35 @@ def parse_requests_options(options: Mapping[str, Any]) -> RequestsOptions:
     }
     unknown = sorted(set(options) - allowed)
     if unknown:
-        raise ValueError(f"unknown requests option(s): {', '.join(unknown)}")
+        raise ValueError(f"unknown httpx option(s): {', '.join(unknown)}")
 
-    use_session = options.get("use-session", True)
+    http2 = options.get("http2", True)
     verify_tls = options.get("verify-tls", True)
-    if not isinstance(use_session, bool):
-        raise TypeError("requests option use-session must be a boolean")
+    if not isinstance(http2, bool):
+        raise TypeError("httpx option http2 must be a boolean")
     if not isinstance(verify_tls, bool):
-        raise TypeError("requests option verify-tls must be a boolean")
+        raise TypeError("httpx option verify-tls must be a boolean")
 
     retries = options.get("retries", 3)
     if isinstance(retries, bool) or not isinstance(retries, int):
-        raise TypeError("requests option retries must be an integer")
+        raise TypeError("httpx option retries must be an integer")
     if retries < 0:
-        raise ValueError("requests option retries must be a non-negative integer")
+        raise ValueError("httpx option retries must be a non-negative integer")
 
     headers_value = options.get("headers", {})
     if not isinstance(headers_value, Mapping):
-        raise TypeError("requests option headers must be an object")
+        raise TypeError("httpx option headers must be an object")
     if any(
         not isinstance(key, str) or not isinstance(value, str)
         for key, value in headers_value.items()
     ):
-        raise ValueError("requests option headers must map strings to strings")
+        raise ValueError("httpx option headers must map strings to strings")
     if any(key.casefold() == "user-agent" for key in headers_value):
         raise ValueError("headers.User-Agent is reserved; use user-agent strategy")
 
     user_agent_value = options.get("user-agent", {})
     if not isinstance(user_agent_value, Mapping):
-        raise TypeError("requests option user-agent must be an object")
+        raise TypeError("httpx option user-agent must be an object")
     unknown_user_agent = sorted(set(user_agent_value) - {"strategy", "fallback"})
     if unknown_user_agent:
         raise ValueError(
@@ -120,17 +120,17 @@ def parse_requests_options(options: Mapping[str, Any]) -> RequestsOptions:
     if not fallback:
         raise ValueError("user-agent.fallback must be a non-empty string")
 
-    return RequestsOptions(
-        use_session=use_session,
+    return HttpxOptions(
+        http2=http2,
         timeout=_number(
             options.get("timeout", 30),
-            "requests option timeout",
+            "httpx option timeout",
             minimum=0.001,
         ),
         retries=retries,
         backoff_factor=_number(
             options.get("backoff-factor", 0.5),
-            "requests option backoff-factor",
+            "httpx option backoff-factor",
             minimum=0,
         ),
         verify_tls=verify_tls,
@@ -139,10 +139,10 @@ def parse_requests_options(options: Mapping[str, Any]) -> RequestsOptions:
     )
 
 
-class RequestsDownloadResponse:
-    """Streaming adapter around a requests response."""
+class HttpxDownloadResponse:
+    """Streaming adapter around an HTTPX response."""
 
-    def __init__(self, response: requests.Response, requested_url: str) -> None:
+    def __init__(self, response: httpx.Response, requested_url: str) -> None:
         self._response = response
         self._requested_url = requested_url
 
@@ -152,7 +152,7 @@ class RequestsDownloadResponse:
 
     @property
     def final_url(self) -> str:
-        return self._response.url
+        return str(self._response.url)
 
     @property
     def status_code(self) -> int:
@@ -162,24 +162,29 @@ class RequestsDownloadResponse:
     def headers(self) -> Mapping[str, str]:
         return self._response.headers
 
-    def iter_bytes(self) -> Iterable[bytes]:
-        for chunk in self._response.iter_content(chunk_size=64 * 1024):
+    async def iter_bytes(self) -> AsyncIterable[bytes]:
+        async for chunk in self._response.aiter_bytes(64 * 1024):
             if chunk:
                 yield chunk
 
-    def close(self) -> None:
-        self._response.close()
+    async def close(self) -> None:
+        await self._response.aclose()
 
 
-class RequestsDownloader:
-    """One worker-local requests transport."""
+class HttpxDownloader:
+    """One shared asynchronous HTTPX transport."""
 
     def __init__(
-        self, options: RequestsOptions, runtime: DownloaderRuntimeContext
+        self, options: HttpxOptions, runtime: DownloaderRuntimeContext
     ) -> None:
         self.options = options
         self.runtime = runtime
-        self._session = requests.Session() if options.use_session else None
+        self._client = httpx.AsyncClient(
+            http2=options.http2,
+            timeout=options.timeout,
+            verify=options.verify_tls,
+            follow_redirects=True,
+        )
         self._user_agent: UserAgent | None = None
         self._user_agent_unavailable = False
 
@@ -199,8 +204,6 @@ class RequestsDownloader:
             value = self._user_agent.random
             if isinstance(value, str) and value:
                 return value
-        # Random generation is non-critical once a fallback is configured;
-        # any provider/data failure must degrade to that static value.
         except Exception as error:  # noqa: BLE001
             self._user_agent_unavailable = True
             logger.warning("Unable to generate a random User-Agent: %s", error)
@@ -209,7 +212,7 @@ class RequestsDownloader:
     def _select_user_agent(self) -> str:
         if self.options.user_agent.strategy == "per-run":
             return self.runtime.get_or_create(
-                "requests.user-agent.per-run", self._random_user_agent
+                "httpx.user-agent.per-run", self._random_user_agent
             )
         return self._random_user_agent()
 
@@ -224,45 +227,36 @@ class RequestsDownloader:
             headers=MappingProxyType(headers),
             metadata=MappingProxyType(
                 {
-                    "use_session": self.options.use_session,
+                    "http2": self.options.http2,
                     "user_agent": user_agent,
                     "user_agent_strategy": self.options.user_agent.strategy,
                 }
             ),
         )
 
-    def open_attempt(
+    async def open_attempt(
         self, request: PreparedDownloadRequest
-    ) -> RequestsDownloadResponse:
-        request_method = self._session.request if self._session else requests.request
+    ) -> HttpxDownloadResponse:
         headers = dict(request.headers)
         headers.update(DEFAULT_HEADERS)
-        response = request_method(
-            "GET",
-            request.url,
-            headers=headers,
-            timeout=self.options.timeout,
-            verify=self.options.verify_tls,
-            allow_redirects=True,
-            stream=False,
-        )
-        return RequestsDownloadResponse(response, request.url)
+        outbound = self._client.build_request("GET", request.url, headers=headers)
+        response = await self._client.send(outbound, stream=True)
+        return HttpxDownloadResponse(response, request.url)
 
     def is_retryable_exception(self, error: BaseException) -> bool:
-        return isinstance(error, requests.RequestException)
+        return isinstance(error, httpx.RequestError)
 
-    def close(self) -> None:
-        if self._session is not None:
-            self._session.close()
+    async def close(self) -> None:
+        await self._client.aclose()
 
 
-class RequestsBackendFactory:
-    """Factory registered under the built-in ``requests`` backend key."""
+class HttpxBackendFactory:
+    """Factory registered under the built-in ``httpx`` backend key."""
 
-    def validate_options(self, options: Mapping[str, Any]) -> RequestsOptions:
-        return parse_requests_options(options)
+    def validate_options(self, options: Mapping[str, Any]) -> HttpxOptions:
+        return parse_httpx_options(options)
 
     def create(
-        self, options: RequestsOptions, runtime: DownloaderRuntimeContext
-    ) -> RequestsDownloader:
-        return RequestsDownloader(options, runtime)
+        self, options: HttpxOptions, runtime: DownloaderRuntimeContext
+    ) -> HttpxDownloader:
+        return HttpxDownloader(options, runtime)

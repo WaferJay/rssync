@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass, field
-from threading import RLock
 from typing import Any, Literal, Protocol
 
 ResourceKind = Literal["rss", "webpage"]
@@ -53,24 +52,26 @@ class DownloadResponse(Protocol):
     @property
     def headers(self) -> Mapping[str, str]: ...
 
-    def iter_bytes(self) -> Iterable[bytes]: ...
+    def iter_bytes(self) -> AsyncIterable[bytes]: ...
 
-    def close(self) -> None: ...
+    async def close(self) -> None: ...
 
 
 class Downloader(Protocol):
-    """A backend instance owned by one worker thread."""
+    """An asynchronous backend shared by concurrent tasks for one preset."""
 
     @property
     def retry_policy(self) -> RetryPolicy: ...
 
     def prepare(self, request: DownloadRequest) -> PreparedDownloadRequest: ...
 
-    def open_attempt(self, request: PreparedDownloadRequest) -> DownloadResponse: ...
+    async def open_attempt(
+        self, request: PreparedDownloadRequest
+    ) -> DownloadResponse: ...
 
     def is_retryable_exception(self, error: BaseException) -> bool: ...
 
-    def close(self) -> None: ...
+    async def close(self) -> None: ...
 
 
 class DownloaderRuntimeContext:
@@ -78,15 +79,13 @@ class DownloaderRuntimeContext:
 
     def __init__(self) -> None:
         self._values: dict[str, Any] = {}
-        self._lock = RLock()
 
     def get_or_create(self, key: str, factory: Callable[[], Any]) -> Any:
         """Return one lazily-created value shared by all downloader presets."""
 
-        with self._lock:
-            if key not in self._values:
-                self._values[key] = factory()
-            return self._values[key]
+        if key not in self._values:
+            self._values[key] = factory()
+        return self._values[key]
 
 
 class DownloaderBackendFactory(Protocol):

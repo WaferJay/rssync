@@ -19,8 +19,8 @@ from rssync.webpage_refresh import (
 )
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 +https://podnews.net/bot PodnewsBot/1.0"
-DEFAULT_REQUESTS_OPTIONS: dict[str, Any] = {
-    "use-session": True,
+DEFAULT_HTTPX_OPTIONS: dict[str, Any] = {
+    "http2": True,
     "timeout": 30,
     "retries": 3,
     "backoff-factor": 0.5,
@@ -234,7 +234,7 @@ def _parse_downloaders(data: object) -> Mapping[str, DownloaderPresetConfig]:
         _only_keys(raw, {"backend", "options"}, location)
 
         if name == "default":
-            backend = raw.get("backend", "requests")
+            backend = raw.get("backend", "httpx")
         elif "backend" not in raw:
             raise ConfigError(f"{location}.backend is required")
         else:
@@ -243,8 +243,8 @@ def _parse_downloaders(data: object) -> Mapping[str, DownloaderPresetConfig]:
             raise ConfigError(f"{location}.backend must be a non-empty string")
 
         options = _mapping(raw.get("options", {}), f"{location}.options")
-        if backend == "requests":
-            options = _deep_merge(DEFAULT_REQUESTS_OPTIONS, options)
+        if backend == "httpx":
+            options = _deep_merge(DEFAULT_HTTPX_OPTIONS, options)
         else:
             options = deepcopy(dict(options))
         presets[name] = DownloaderPresetConfig(

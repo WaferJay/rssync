@@ -20,7 +20,7 @@
     "downloaders": {
         "default": {
             "options": {
-                "use-session": true,
+                "http2": true,
                 "timeout": 30,
                 "retries": 3,
                 "backoff-factor": 0.5,
@@ -31,9 +31,9 @@
             }
         },
         "rotating": {
-            "backend": "requests",
+            "backend": "httpx",
             "options": {
-                "use-session": false,
+                "http2": false,
                 "user-agent": {
                     "strategy": "per-request"
                 }

@@ -153,8 +153,9 @@ original response remains in `feeds/`.
 
 ## Downloader presets
 
-The `default` preset always exists and uses the built-in `requests` backend. It
-does not need to be declared. A partial declaration overrides its defaults:
+The `default` preset always exists and uses the built-in asynchronous `httpx`
+backend. It does not need to be declared. A partial declaration overrides its
+defaults:
 
 ```json
 {
@@ -162,16 +163,16 @@ does not need to be declared. A partial declaration overrides its defaults:
     "default": {
       "options": {
         "timeout": 45,
-        "use-session": true,
+        "http2": true,
         "user-agent": {
           "strategy": "per-run"
         }
       }
     },
     "rotating": {
-      "backend": "requests",
+      "backend": "httpx",
       "options": {
-        "use-session": false,
+        "http2": false,
         "user-agent": {
           "strategy": "per-request"
         }
@@ -181,11 +182,12 @@ does not need to be declared. A partial declaration overrides its defaults:
 }
 ```
 
-The `requests` options are:
+The `httpx` options are:
 
-- `use-session`: reuse one Session per worker thread; defaults to `true`.
-- `timeout`: connection and individual read timeout in seconds, not a total
-  response deadline.
+- `http2`: enable HTTP/2 when supported by the server; defaults to `true` and
+  falls back to HTTP/1.1 when necessary.
+- `timeout`: connection, read, write, and connection-pool inactivity timeout in
+  seconds, not a total response deadline.
 - `retries`: additional attempts after the initial request.
 - `backoff-factor`: retry delay factor; retry `n` waits
   `factor * 2^(n-1)` seconds, unless a longer valid `Retry-After` is returned.
@@ -200,9 +202,14 @@ streamed to same-filesystem temporary files and atomically committed. There is
 no application-level response size limit.
 
 Third-party backends can register a factory under the `rssync.downloaders`
-Python entry-point group. The public protocols are exported from
-`rssync.downloaders`; a factory validates preset options and creates one
-downloader instance per worker thread.
+Python entry-point group. The public asynchronous protocols are exported from
+`rssync.downloaders`; a factory validates preset options and creates one shared
+downloader instance per preset. Response streaming and backend cleanup are
+awaitable operations.
+
+Python integrations call `await SyncEngine(config).run()`. The exported
+`fetch_rss_xml` and `rss_update_worker` compatibility helpers are also
+coroutines; the `rssync` command itself manages the asyncio event loop.
 
 ## Concurrency
 
@@ -224,8 +231,8 @@ begin. Their defaults are 2 and 8.
 `per-domain-downloads` optionally limits active attempts for each hostname. The
 limit is shared by all downloader presets and both stages; protocol and port do
 not create separate buckets. Omitting it leaves per-domain concurrency
-unlimited. When configured, queued downloads are interleaved by hostname so
-tasks waiting for one busy hostname do not occupy every worker.
+unlimited. Tasks waiting for one busy hostname do not reserve a stage-wide
+download slot, so other hostnames can continue making progress.
 
 `request-interval` is the minimum number of seconds between the actual start
 times of two attempts for the same hostname. It accepts zero and fractional

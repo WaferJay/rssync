@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,16 +21,16 @@ class BrokenResponse:
     status_code = 200
     headers: ClassVar[dict[str, str]] = {"Content-Type": "text/html"}
 
-    def iter_bytes(self):
+    async def iter_bytes(self):
         yield b"partial"
         raise OSError("stream interrupted")
 
-    def close(self):
+    async def close(self):
         return None
 
 
 class SuccessfulResponse(BrokenResponse):
-    def iter_bytes(self):
+    async def iter_bytes(self):
         yield b"complete-body"
 
 
@@ -50,7 +51,7 @@ class RetryDownloader:
     def prepare(self, request: DownloadRequest):
         return PreparedDownloadRequest(request.url, request.resource_kind, {}, {})
 
-    def open_attempt(self, request):
+    async def open_attempt(self, request):
         del request
         self.attempts += 1
         return BrokenResponse() if self.attempts == 1 else SuccessfulResponse()
@@ -58,7 +59,7 @@ class RetryDownloader:
     def is_retryable_exception(self, error):
         return isinstance(error, OSError)
 
-    def close(self):
+    async def close(self):
         return None
 
 
@@ -82,13 +83,13 @@ class FakeMonotonic:
     def __call__(self):
         return self.now
 
-    def sleep(self, delay):
+    async def sleep(self, delay):
         self.delays.append(delay)
         self.now += delay
 
 
-class DownloadServiceTest(unittest.TestCase):
-    def test_request_interval_is_shared_by_hostname_across_stages(self):
+class DownloadServiceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_request_interval_is_shared_by_hostname_across_stages(self):
         clock = FakeMonotonic()
         concurrency = DownloadConcurrency(
             2,
@@ -100,17 +101,17 @@ class DownloadServiceTest(unittest.TestCase):
         )
         starts = []
 
-        with concurrency.slot("rss", "https://Example.COM/feed.xml"):
+        async with concurrency.slot("rss", "https://Example.COM/feed.xml"):
             starts.append(clock())
-        with concurrency.slot("webpage", "https://example.org/page"):
+        async with concurrency.slot("webpage", "https://example.org/page"):
             starts.append(clock())
-        with concurrency.slot("webpage", "http://example.com:8080/page"):
+        async with concurrency.slot("webpage", "http://example.com:8080/page"):
             starts.append(clock())
 
         self.assertEqual(starts, [0, 0, 1.25])
         self.assertEqual(clock.delays, [1.25])
 
-    def test_stream_retry_discards_partial_file_and_restarts(self):
+    async def test_stream_retry_discards_partial_file_and_restarts(self):
         config = parse_config(
             {
                 "downloaders": {"default": {"backend": "retry"}},
@@ -122,16 +123,20 @@ class DownloadServiceTest(unittest.TestCase):
         registry.register("retry", factory)
         manager = DownloaderManager(config.downloaders, registry)
         delays = []
+
+        async def record_delay(delay):
+            delays.append(delay)
+
         service = DownloadService(
             manager,
             DownloadConcurrency(1, 1),
-            sleep=delays.append,
+            sleep=record_delay,
             clock=lambda: 123,
         )
 
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "page.html")
-            result = service.download(
+            result = await service.download(
                 url="https://example.com/page",
                 resource_kind="webpage",
                 preset_name="default",
@@ -143,9 +148,9 @@ class DownloadServiceTest(unittest.TestCase):
             self.assertEqual(factory.instance.attempts, 2)
             self.assertEqual(delays, [0.25])
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
-        manager.close()
+        await manager.close()
 
-    def test_retries_are_subject_to_the_request_interval(self):
+    async def test_retries_are_subject_to_the_request_interval(self):
         clock = FakeMonotonic()
 
         class TimedRetryDownloader(RetryDownloader):
@@ -153,9 +158,9 @@ class DownloadServiceTest(unittest.TestCase):
                 super().__init__()
                 self.started_at = []
 
-            def open_attempt(self, request):
+            async def open_attempt(self, request):
                 self.started_at.append(clock())
-                return super().open_attempt(request)
+                return await super().open_attempt(request)
 
         downloader = TimedRetryDownloader()
         config = parse_config(
@@ -182,7 +187,7 @@ class DownloadServiceTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            service.download(
+            await service.download(
                 url="https://example.com/page",
                 resource_kind="webpage",
                 preset_name="default",
@@ -191,11 +196,11 @@ class DownloadServiceTest(unittest.TestCase):
 
         self.assertEqual(downloader.started_at, [0, 1])
         self.assertEqual(clock.delays, [0.25, 0.75])
-        manager.close()
+        await manager.close()
 
-    def test_retry_after_longer_than_backoff_is_honored(self):
+    async def test_retry_after_longer_than_backoff_is_honored(self):
         class StatusRetryDownloader(RetryDownloader):
-            def open_attempt(self, request):
+            async def open_attempt(self, request):
                 del request
                 self.attempts += 1
                 if self.attempts == 1:
@@ -212,14 +217,18 @@ class DownloadServiceTest(unittest.TestCase):
         registry.register("retry", RetryFactory(StatusRetryDownloader()))
         manager = DownloaderManager(config.downloaders, registry)
         delays = []
+
+        async def record_delay(delay):
+            delays.append(delay)
+
         service = DownloadService(
             manager,
             DownloadConcurrency(1, 1),
-            sleep=delays.append,
+            sleep=record_delay,
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            service.download(
+            await service.download(
                 url="https://example.com/page",
                 resource_kind="webpage",
                 preset_name="default",
@@ -227,7 +236,66 @@ class DownloadServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(delays, [1.5])
-        manager.close()
+        await manager.close()
+
+    async def test_cancellation_closes_response_and_removes_partial_file(self):
+        class BlockingResponse(BrokenResponse):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.closed = False
+
+            async def iter_bytes(self):
+                yield b"partial"
+                self.started.set()
+                await asyncio.Future()
+
+            async def close(self):
+                self.closed = True
+
+        class BlockingDownloader(RetryDownloader):
+            retry_policy = RetryPolicy(retries=0, backoff_factor=0)
+
+            def __init__(self, response):
+                super().__init__()
+                self.response = response
+
+            async def open_attempt(self, request):
+                del request
+                return self.response
+
+        response = BlockingResponse()
+        downloader = BlockingDownloader(response)
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "blocking"}},
+                "feeds": [{"url": "https://example.com/rss.xml"}],
+            }
+        )
+        registry = DownloaderRegistry(load_plugins=False)
+        registry.register("blocking", RetryFactory(downloader))
+        manager = DownloaderManager(config.downloaders, registry)
+        service = DownloadService(manager, DownloadConcurrency(1, 1))
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "page.html")
+            task = asyncio.create_task(
+                service.download(
+                    url="https://example.com/page",
+                    resource_kind="webpage",
+                    preset_name="default",
+                    target_path=target,
+                )
+            )
+            await response.started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertTrue(response.closed)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+        await manager.close()
 
 
 if __name__ == "__main__":

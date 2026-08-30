@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
 import time
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import Lock, Semaphore
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
@@ -54,8 +54,8 @@ class DownloadConcurrency:
 
     @dataclass(slots=True)
     class _DomainState:
-        semaphore: Semaphore | None
-        start_lock: Lock
+        semaphore: asyncio.Semaphore | None
+        start_lock: asyncio.Lock
         last_started: float | None = None
 
     def __init__(
@@ -66,54 +66,56 @@ class DownloadConcurrency:
         request_interval: float = 0.0,
         *,
         monotonic: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._stages = {
-            "rss": Semaphore(rss_limit),
-            "webpage": Semaphore(webpage_limit),
+            "rss": asyncio.Semaphore(rss_limit),
+            "webpage": asyncio.Semaphore(webpage_limit),
         }
         self._per_domain_limit = per_domain_limit
         self._request_interval = request_interval
         self._monotonic = monotonic
         self._sleep = sleep
         self._domains: dict[str, DownloadConcurrency._DomainState] = {}
-        self._domains_lock = Lock()
+        self._domains_lock = asyncio.Lock()
 
-    def _domain_state(self, url: str) -> _DomainState:
+    async def _domain_state(self, url: str) -> _DomainState:
         hostname = urlsplit(url).hostname
         if hostname is None:
             raise ValueError(f"download URL does not contain a hostname: {url}")
         hostname = hostname.casefold()
-        with self._domains_lock:
+        async with self._domains_lock:
             state = self._domains.get(hostname)
             if state is None:
                 state = self._DomainState(
                     semaphore=(
-                        Semaphore(self._per_domain_limit)
+                        asyncio.Semaphore(self._per_domain_limit)
                         if self._per_domain_limit is not None
                         else None
                     ),
-                    start_lock=Lock(),
+                    start_lock=asyncio.Lock(),
                 )
                 self._domains[hostname] = state
             return state
 
-    @contextmanager
-    def slot(self, resource_kind: ResourceKind, url: str) -> Iterator[None]:
+    @asynccontextmanager
+    async def slot(
+        self, resource_kind: ResourceKind, url: str
+    ) -> AsyncIterator[None]:
         """Reserve stage and hostname capacity for one complete attempt."""
 
         stage = self._stages[resource_kind]
-        domain = self._domain_state(url)
+        domain = await self._domain_state(url)
         if domain.semaphore is not None:
-            domain.semaphore.acquire()
+            await domain.semaphore.acquire()
         stage_acquired = False
         try:
-            with domain.start_lock:
+            async with domain.start_lock:
                 if domain.last_started is not None:
                     earliest_start = domain.last_started + self._request_interval
                     while (delay := earliest_start - self._monotonic()) > 0:
-                        self._sleep(delay)
-                stage.acquire()
+                        await self._sleep(delay)
+                await stage.acquire()
                 stage_acquired = True
                 domain.last_started = self._monotonic()
             try:
@@ -174,7 +176,7 @@ class DownloadService:
         manager: DownloaderManager,
         concurrency: DownloadConcurrency,
         *,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.manager = manager
@@ -182,7 +184,7 @@ class DownloadService:
         self.sleep = sleep
         self.clock = clock
 
-    def download(
+    async def download(
         self,
         *,
         url: str,
@@ -204,11 +206,11 @@ class DownloadService:
             retry_after: float | None = None
             retryable = False
             try:
-                with self.concurrency.slot(
+                async with self.concurrency.slot(
                     prepared.resource_kind,
                     prepared.url,
                 ):
-                    response = downloader.open_attempt(prepared)
+                    response = await downloader.open_attempt(prepared)
                     try:
                         headers = dict(response.headers)
                         status_code = response.status_code
@@ -231,13 +233,13 @@ class DownloadService:
                         digest = hashlib.sha256()
                         byte_count = 0
                         with temporary.open("wb") as file:
-                            for chunk in response.iter_bytes():
+                            async for chunk in response.iter_bytes():
                                 file.write(chunk)
                                 digest.update(chunk)
                                 byte_count += len(chunk)
                     finally:
                         try:
-                            response.close()
+                            await response.close()
                         finally:
                             response = None
 
@@ -273,7 +275,7 @@ class DownloadService:
                     raise
             finally:
                 if response is not None:
-                    response.close()
+                    await response.close()
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
 
@@ -287,6 +289,6 @@ class DownloadService:
                 delay,
             )
             if delay > 0:
-                self.sleep(delay)
+                await self.sleep(delay)
 
         raise AssertionError("unreachable download retry state")

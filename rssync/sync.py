@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import concurrent.futures
+import asyncio
 import errno
 import logging
 import time
-from collections import deque
-from collections.abc import Callable, Collection, Hashable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
-from urllib.parse import urlsplit
 
 from rssync.config import AppConfig, FeedConfig
 from rssync.download_service import (
@@ -82,30 +80,6 @@ TaskValue = TypeVar("TaskValue")
 TaskResult = TypeVar("TaskResult")
 
 
-def _interleave_by_hostname(
-    tasks: Iterable[tuple[TaskKey, TaskValue]],
-    task_url: Callable[[TaskValue], str],
-) -> list[tuple[TaskKey, TaskValue]]:
-    """Keep host-local order while round-robin interleaving host queues."""
-
-    grouped: dict[str, deque[tuple[TaskKey, TaskValue]]] = {}
-    for item in tasks:
-        url = task_url(item[1])
-        hostname = urlsplit(url).hostname
-        if hostname is None:
-            raise ValueError(f"download URL does not contain a hostname: {url}")
-        grouped.setdefault(hostname.casefold(), deque()).append(item)
-
-    pending = deque(grouped.values())
-    interleaved: list[tuple[TaskKey, TaskValue]] = []
-    while pending:
-        hostname_tasks = pending.popleft()
-        interleaved.append(hostname_tasks.popleft())
-        if hostname_tasks:
-            pending.append(hostname_tasks)
-    return interleaved
-
-
 class SyncEngine:
     """Synchronize configured RSS feeds and optionally archive item pages."""
 
@@ -143,38 +117,26 @@ class SyncEngine:
             clock=self.clock,
         )
 
-    def _run_parallel(
+    async def _run_parallel(
         self,
         tasks: Iterable[tuple[TaskKey, TaskValue]],
-        limit: int,
-        thread_name_prefix: str,
-        worker: Callable[[TaskValue], TaskResult],
-        task_url: Callable[[TaskValue], str] | None = None,
+        worker: Callable[[TaskValue], Awaitable[TaskResult]],
     ) -> dict[TaskKey, TaskResult]:
         queued = list(tasks)
-        if task_url is not None:
-            # Do not let tasks waiting on one domain consume every worker.
-            queued = _interleave_by_hostname(queued, task_url)
         if not queued:
             return {}
-        results: dict[TaskKey, TaskResult] = {}
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(limit, len(queued)),
-            thread_name_prefix=thread_name_prefix,
-        ) as executor:
-            futures: dict[concurrent.futures.Future[TaskResult], TaskKey] = {}
+        scheduled: list[tuple[TaskKey, asyncio.Task[TaskResult]]] = []
+        async with asyncio.TaskGroup() as group:
             for key, task in queued:
-                futures[executor.submit(worker, task)] = key
-            for future in concurrent.futures.as_completed(futures):
-                results[futures[future]] = future.result()
-        return results
+                scheduled.append((key, group.create_task(worker(task))))
+        return {key: task.result() for key, task in scheduled}
 
-    def _fetch_feeds(self) -> dict[int, FeedOutcome]:
-        def worker(item: tuple[int, FeedConfig]) -> FeedOutcome:
+    async def _fetch_feeds(self) -> dict[int, FeedOutcome]:
+        async def worker(item: tuple[int, FeedConfig]) -> FeedOutcome:
             index, feed = item
             try:
                 target = self.root / RSS_FEED_NEW_PATH / rss_feed_relpath(feed.url)
-                downloaded = self.service.download(
+                downloaded = await self.service.download(
                     url=feed.url,
                     resource_kind="rss",
                     preset_name=feed.rss_downloader,
@@ -190,16 +152,9 @@ class SyncEngine:
             (index, (index, feed))
             for index, feed in enumerate(self.config.feeds)
         ]
-        return self._run_parallel(
+        return await self._run_parallel(
             tasks,
-            self.config.concurrency.rss_downloads,
-            "rssync-rss",
             worker,
-            task_url=(
-                (lambda item: item[1].url)
-                if self.config.concurrency.per_domain_downloads is not None
-                else None
-            ),
         )
 
     def _detect_feed_changes(
@@ -301,14 +256,16 @@ class SyncEngine:
             protected.update(link.canonical_url for link in document.links)
         return protected, True
 
-    def _fetch_pages(self, tasks: Mapping[str, PageTask]) -> dict[str, PageOutcome]:
+    async def _fetch_pages(
+        self, tasks: Mapping[str, PageTask]
+    ) -> dict[str, PageOutcome]:
         if not tasks:
             return {}
 
-        def worker(task: PageTask) -> PageOutcome:
+        async def worker(task: PageTask) -> PageOutcome:
             try:
                 target = self.root / self.config.webpages.storage_path / task.relpath
-                downloaded = self.service.download(
+                downloaded = await self.service.download(
                     url=task.canonical_url,
                     resource_kind="webpage",
                     preset_name=task.preset_name,
@@ -323,16 +280,9 @@ class SyncEngine:
                 return PageOutcome(task, error=error)
 
         queued_tasks = [(url, task) for url, task in tasks.items()]
-        return self._run_parallel(
+        return await self._run_parallel(
             queued_tasks,
-            self.config.concurrency.webpage_downloads,
-            "rssync-webpage",
             worker,
-            task_url=(
-                (lambda task: task.canonical_url)
-                if self.config.concurrency.per_domain_downloads is not None
-                else None
-            ),
         )
 
     def _valid_page_cache(self, record: Mapping[str, Any] | None) -> bool:
@@ -406,7 +356,6 @@ class SyncEngine:
                     "response_headers": dict(downloaded.response_headers),
                     "downloader": task.preset_name,
                     "backend": downloaded.backend_name,
-                    "use_session": downloaded.metadata.get("use_session"),
                     "user_agent": downloaded.metadata.get("user_agent"),
                     "user_agent_strategy": downloaded.metadata.get(
                         "user_agent_strategy"
@@ -607,7 +556,6 @@ class SyncEngine:
             "change_detection": {
                 "ignore_tags": list(feed.change_detection.ignore_tags)
             },
-            "use_session": downloaded.metadata.get("use_session"),
             "user_agent": downloaded.metadata.get("user_agent"),
             "user_agent_strategy": downloaded.metadata.get("user_agent_strategy"),
             "updated_at": updated_at,
@@ -617,20 +565,20 @@ class SyncEngine:
         }
         return record, public_path if changed else None
 
-    def run(self) -> dict[str, Any]:
+    async def run(self) -> dict[str, Any]:
         """Execute a complete synchronization and return both manifests."""
 
         try:
             previous_feeds = load_feed_records(self.root / RSS_FEED_MANIFEST_PATH)
             previous_pages = load_page_records(self.root / WEBPAGE_MANIFEST_PATH)
-            feed_outcomes = self._fetch_feeds()
+            feed_outcomes = await self._fetch_feeds()
             self._detect_feed_changes(feed_outcomes)
 
             page_candidates, page_tasks = self._select_pages(
                 feed_outcomes,
                 previous_pages,
             )
-            page_outcomes = self._fetch_pages(page_tasks)
+            page_outcomes = await self._fetch_pages(page_tasks)
             if self.config.archive_current_only:
                 protected_pages, webpage_cleanup_safe = self._protected_page_urls(
                     feed_outcomes,
@@ -699,4 +647,4 @@ class SyncEngine:
             )
             return {"feeds": feed_manifest, "pages": page_manifest}
         finally:
-            self.manager.close()
+            await self.manager.close()

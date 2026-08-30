@@ -1,11 +1,10 @@
-"""Downloader backend discovery and worker-local instance management."""
+"""Downloader backend discovery and shared asynchronous instance management."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import metadata
-from threading import Lock, local
 from typing import Any
 
 from rssync.config import DownloaderPresetConfig
@@ -14,7 +13,7 @@ from rssync.downloaders.base import (
     DownloaderBackendFactory,
     DownloaderRuntimeContext,
 )
-from rssync.downloaders.requests_backend import RequestsBackendFactory
+from rssync.downloaders.httpx_backend import HttpxBackendFactory
 
 ENTRY_POINT_GROUP = "rssync.downloaders"
 
@@ -28,7 +27,7 @@ class DownloaderRegistry:
 
     def __init__(self, *, load_plugins: bool = True) -> None:
         self._factories: dict[str, DownloaderBackendFactory] = {}
-        self.register("requests", RequestsBackendFactory())
+        self.register("httpx", HttpxBackendFactory())
         if load_plugins:
             self.load_entry_points()
 
@@ -72,7 +71,7 @@ class _ValidatedPreset:
 
 
 class DownloaderManager:
-    """Create one downloader instance per preset and worker thread."""
+    """Create one shared asynchronous downloader instance per preset."""
 
     def __init__(
         self,
@@ -91,34 +90,25 @@ class DownloaderManager:
                     f"invalid options for downloader preset {name!r}: {error}"
                 ) from error
             self._presets[name] = _ValidatedPreset(preset, factory, options)
-        self._local = local()
-        self._instances: list[Downloader] = []
-        self._instances_lock = Lock()
+        self._instances: dict[str, Downloader] = {}
 
     def get(self, preset_name: str) -> Downloader:
-        """Return this worker thread's instance for a preset."""
+        """Return the process-local instance for a preset."""
 
-        instances = getattr(self._local, "instances", None)
-        if instances is None:
-            instances = {}
-            self._local.instances = instances
-        if preset_name not in instances:
+        if preset_name not in self._instances:
             preset = self._presets[preset_name]
             instance = preset.factory.create(preset.options, self.runtime)
-            instances[preset_name] = instance
-            with self._instances_lock:
-                self._instances.append(instance)
-        return instances[preset_name]
+            self._instances[preset_name] = instance
+        return self._instances[preset_name]
 
     def backend_name(self, preset_name: str) -> str:
         """Return the configured backend name for a preset."""
 
         return self._presets[preset_name].config.backend
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Close all downloader instances created during the run."""
 
-        with self._instances_lock:
-            instances, self._instances = self._instances, []
+        instances, self._instances = list(self._instances.values()), {}
         for instance in instances:
-            instance.close()
+            await instance.close()
