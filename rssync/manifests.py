@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from rssync.rss import canonicalize_http_url
 from rssync.storage import (
     manifest_path_relpath,
     root_relative_manifest_path,
@@ -16,6 +17,39 @@ from rssync.storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def page_record_source_urls(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return a page record's primary source URL followed by valid aliases."""
+
+    source_url = record.get("source_url")
+    if not isinstance(source_url, str):
+        return ()
+    urls = [source_url]
+    aliases = record.get("aliases")
+    if isinstance(aliases, list):
+        urls.extend(alias for alias in aliases if isinstance(alias, str) and alias)
+    return tuple(dict.fromkeys(urls))
+
+
+def index_page_records(
+    records: Iterable[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Index page records by every normalized primary URL and alias."""
+
+    indexed: dict[str, Mapping[str, Any]] = {}
+    for record in records:
+        for source_url in page_record_source_urls(record):
+            canonical_url = canonicalize_http_url(source_url)
+            if canonical_url is None:
+                continue
+            existing = indexed.setdefault(canonical_url, record)
+            if existing is not record:
+                logger.warning(
+                    "Ignoring conflicting webpage alias in manifest: %s",
+                    source_url,
+                )
+    return indexed
 
 
 def _read_manifest(path: str | Path, label: str) -> dict[str, Any]:
@@ -62,6 +96,23 @@ def load_page_records(path: str | Path = "pages.json") -> dict[str, dict[str, An
             continue
         normalized = dict(record)
         normalized.pop("local_url", None)
+        aliases = normalized.get("aliases")
+        if isinstance(aliases, list):
+            normalized_aliases: list[str] = []
+            for alias in aliases:
+                if (
+                    isinstance(alias, str)
+                    and alias
+                    and alias != normalized["source_url"]
+                    and alias not in normalized_aliases
+                ):
+                    normalized_aliases.append(alias)
+            if normalized_aliases:
+                normalized["aliases"] = normalized_aliases
+            else:
+                normalized.pop("aliases", None)
+        else:
+            normalized.pop("aliases", None)
         path_value = normalized.get("path")
         if isinstance(path_value, str):
             relative = manifest_path_relpath(path_value)

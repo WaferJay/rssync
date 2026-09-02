@@ -1,6 +1,36 @@
 import unittest
 
-from rssync.rss import rss_documents_equal
+from rssync.rss import canonicalize_http_url, rss_documents_equal
+
+
+class UrlCanonicalizationTest(unittest.TestCase):
+    def test_normalizes_equivalent_http_url_spelling(self):
+        self.assertEqual(
+            canonicalize_http_url(
+                "HTTPS://Example.COM:443/a/./b/../%7euser?q=%41%2f#section"
+            ),
+            "https://example.com/a/~user?q=A%2F",
+        )
+
+    def test_decodes_only_unreserved_percent_escapes(self):
+        self.assertEqual(
+            canonicalize_http_url("https://example.com/%7e/a%2fb?x=%2e%2f"),
+            "https://example.com/~/a%2Fb?x=.%2F",
+        )
+
+    def test_preserves_semantically_distinct_url_components(self):
+        self.assertNotEqual(
+            canonicalize_http_url("https://example.com/article"),
+            canonicalize_http_url("https://example.com/article/"),
+        )
+        self.assertNotEqual(
+            canonicalize_http_url("https://example.com/?a=1&b=2"),
+            canonicalize_http_url("https://example.com/?b=2&a=1"),
+        )
+        self.assertEqual(
+            canonicalize_http_url("https://example.com//article"),
+            "https://example.com//article",
+        )
 
 
 class RssComparisonTest(unittest.TestCase):

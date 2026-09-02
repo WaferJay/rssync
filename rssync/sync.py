@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import shutil
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Collection, Hashable, Iterable, Mapping
 from dataclasses import dataclass
@@ -19,13 +21,20 @@ from rssync.download_service import (
     DownloadService,
 )
 from rssync.downloaders.registry import DownloaderManager, DownloaderRegistry
-from rssync.manifests import load_feed_records, load_page_records
-from rssync.rss import RssDocument, rss_documents_equal
+from rssync.manifests import (
+    index_page_records,
+    load_feed_records,
+    load_page_records,
+    page_record_source_urls,
+)
+from rssync.rss import RssDocument, canonicalize_http_url, rss_documents_equal
 from rssync.storage import (
     atom_feed_local_url,
+    commit_download,
     manifest_path_relpath,
     rss_feed_local_url,
     rss_feed_relpath,
+    temporary_sibling,
     webpage_manifest_path,
     webpage_relpath,
     write_bytes_if_changed,
@@ -73,6 +82,14 @@ class PageTask:
     first_feed_url: str
     relpath: str
     refresh_policy: str
+
+
+@dataclass(slots=True)
+class PageCandidate:
+    """One page identity and all current source URLs known to reference it."""
+
+    source_urls: list[str]
+    first_task: PageTask
 
 
 @dataclass(slots=True)
@@ -187,10 +204,26 @@ class SyncEngine:
         self,
         feed_outcomes: Mapping[int, FeedOutcome],
         previous_pages: Mapping[str, Mapping[str, Any]],
-    ) -> tuple[dict[str, PageTask], dict[str, PageTask]]:
-        candidates: dict[str, PageTask] = {}
+    ) -> tuple[dict[str, PageCandidate], dict[str, PageTask]]:
+        candidates: dict[str, PageCandidate] = {}
         tasks: dict[str, PageTask] = {}
         cache_validity: dict[str, bool] = {}
+        previous_by_url = index_page_records(previous_pages.values())
+        for record in previous_pages.values():
+            source_url = record.get("source_url")
+            if (
+                not isinstance(source_url, str)
+                or canonicalize_http_url(source_url) is None
+            ):
+                continue
+            final_url = record.get("final_url")
+            canonical_final = (
+                canonicalize_http_url(final_url)
+                if isinstance(final_url, str)
+                else None
+            )
+            if canonical_final is not None:
+                previous_by_url.setdefault(canonical_final, record)
         for index, feed in enumerate(self.config.feeds):
             outcome = feed_outcomes[index]
             if not feed.download_webpages or outcome.document is None:
@@ -199,6 +232,13 @@ class SyncEngine:
                 raise AssertionError("parsed RSS has no change result")
             strategy = self.refresh_strategies[feed.webpage_refresh_policy]
             for link in outcome.document.links:
+                prior = previous_by_url.get(link.canonical_url)
+                identity_url = (
+                    prior["source_url"]
+                    if prior is not None
+                    and isinstance(prior.get("source_url"), str)
+                    else link.canonical_url
+                )
                 task = PageTask(
                     canonical_url=link.canonical_url,
                     preset_name=feed.webpage_downloader,
@@ -206,12 +246,15 @@ class SyncEngine:
                     relpath=webpage_relpath(link.canonical_url),
                     refresh_policy=feed.webpage_refresh_policy,
                 )
-                candidates.setdefault(link.canonical_url, task)
-                if link.canonical_url not in cache_validity:
-                    cache_validity[link.canonical_url] = self._valid_page_cache(
-                        previous_pages.get(link.canonical_url)
-                    )
-                cache_valid = cache_validity[link.canonical_url]
+                candidate = candidates.get(identity_url)
+                if candidate is None:
+                    candidate = PageCandidate([], task)
+                    candidates[identity_url] = candidate
+                if link.canonical_url not in candidate.source_urls:
+                    candidate.source_urls.append(link.canonical_url)
+                if identity_url not in cache_validity:
+                    cache_validity[identity_url] = self._valid_page_cache(prior)
+                cache_valid = cache_validity[identity_url]
                 context = WebpageRefreshContext(
                     canonical_url=link.canonical_url,
                     feed_url=feed.url,
@@ -219,10 +262,10 @@ class SyncEngine:
                     rss_changed=outcome.rss_changed,
                 )
                 if (
-                    link.canonical_url not in tasks
+                    identity_url not in tasks
                     and (not cache_valid or strategy.should_fetch(context))
                 ):
-                    tasks[link.canonical_url] = task
+                    tasks[identity_url] = task
         return candidates, tasks
 
     def _protected_page_urls(
@@ -266,14 +309,16 @@ class SyncEngine:
         return protected, True
 
     async def _fetch_pages(
-        self, tasks: Mapping[str, PageTask]
+        self,
+        tasks: Mapping[str, PageTask],
+        staging_root: Path,
     ) -> dict[str, PageOutcome]:
         if not tasks:
             return {}
 
         async def worker(task: PageTask) -> PageOutcome:
             try:
-                target = self.root / self.config.webpages.storage_path / task.relpath
+                target = staging_root / task.relpath
                 downloaded = await self.service.download(
                     url=task.canonical_url,
                     resource_kind="webpage",
@@ -301,6 +346,37 @@ class SyncEngine:
         if path is None:
             return False
         return self.root.joinpath(*path.parts).is_file()
+
+    @staticmethod
+    def _add_page_aliases(
+        record: dict[str, Any],
+        source_urls: Iterable[str],
+    ) -> None:
+        """Add stable, unique aliases without changing the primary source URL."""
+
+        primary = record.get("source_url")
+        if not isinstance(primary, str):
+            raise AssertionError("webpage record has no primary source URL")
+        aliases = list(page_record_source_urls(record)[1:])
+        for source_url in source_urls:
+            if source_url != primary and source_url not in aliases:
+                aliases.append(source_url)
+        if aliases:
+            record["aliases"] = aliases
+        else:
+            record.pop("aliases", None)
+
+    @staticmethod
+    def _page_record_matches(
+        record: Mapping[str, Any],
+        canonical_urls: Collection[str],
+    ) -> bool:
+        """Return whether any primary URL or alias is in a canonical URL set."""
+
+        return any(
+            canonicalize_http_url(source_url) in canonical_urls
+            for source_url in page_record_source_urls(record)
+        )
 
     def _atom_document(
         self,
@@ -358,9 +434,10 @@ class SyncEngine:
             if isinstance(record.get("source_url"), str)
         }
         atom_config = self.config.webpages.atom
+        page_lookup = index_page_records(page_records.values())
         available_pages = {
             source_url
-            for source_url, record in page_records.items()
+            for source_url, record in page_lookup.items()
             if self._valid_page_cache(record)
         }
         changed_paths: list[str] = []
@@ -399,7 +476,7 @@ class SyncEngine:
                 document,
                 source_feed_url=feed.url,
                 self_path=public_path,
-                page_records=page_records,
+                page_records=page_lookup,
                 available_pages=available_pages,
                 missing_page_policy=atom_config.missing_page_policy,
                 fallback_updated_at=fallback_updated_at,
@@ -433,7 +510,7 @@ class SyncEngine:
 
     def _update_pages(
         self,
-        candidates: Mapping[str, PageTask],
+        candidates: Mapping[str, PageCandidate],
         outcomes: Mapping[str, PageOutcome],
         previous: Mapping[str, Mapping[str, Any]],
         protected_urls: Collection[str],
@@ -443,73 +520,194 @@ class SyncEngine:
         list[str],
         dict[str, dict[str, Any]],
     ]:
+        protected = set(protected_urls)
         if self.config.archive_current_only and cleanup_safe:
             records = {
                 url: dict(record)
                 for url, record in previous.items()
-                if url in protected_urls
+                if self._page_record_matches(record, protected)
             }
         else:
             records = {url: dict(record) for url, record in previous.items()}
         changed_paths: list[str] = []
 
-        for canonical_url, candidate in candidates.items():
-            prior = previous.get(canonical_url)
-            outcome = outcomes.get(canonical_url)
+        previous_by_final: dict[str, list[str]] = {}
+        for identity_url, record in previous.items():
+            if canonicalize_http_url(identity_url) is None:
+                continue
+            final_url = record.get("final_url")
+            canonical_final = (
+                canonicalize_http_url(final_url)
+                if isinstance(final_url, str)
+                else None
+            )
+            if canonical_final is not None:
+                previous_by_final.setdefault(canonical_final, []).append(identity_url)
+
+        successful_final = {
+            identity_url: canonicalize_http_url(outcome.download.final_url)
+            for identity_url, outcome in outcomes.items()
+            if outcome.download is not None
+        }
+        final_targets: dict[str, str] = {}
+        target_members: dict[str, list[str]] = {}
+        target_final_urls: dict[str, str | None] = {}
+        representatives: dict[str, PageOutcome] = {}
+
+        for identity_url, outcome in outcomes.items():
+            if outcome.download is None:
+                continue
+            canonical_final = successful_final[identity_url]
+            target_identity: str | None = None
+            if canonical_final is not None:
+                eligible_previous = [
+                    previous_identity
+                    for previous_identity in previous_by_final.get(canonical_final, [])
+                    if successful_final.get(previous_identity, canonical_final)
+                    == canonical_final
+                ]
+                if eligible_previous:
+                    target_identity = next(
+                        (
+                            previous_identity
+                            for previous_identity in eligible_previous
+                            if self._valid_page_cache(
+                                previous.get(previous_identity)
+                            )
+                        ),
+                        eligible_previous[0],
+                    )
+                else:
+                    target_identity = final_targets.setdefault(
+                        canonical_final,
+                        identity_url,
+                    )
+            if target_identity is None:
+                target_identity = identity_url
+            target_members.setdefault(target_identity, []).append(identity_url)
+            target_final_urls[target_identity] = canonical_final
+            representatives.setdefault(target_identity, outcome)
+
+        covered_candidates: set[str] = set()
+        for target_identity, member_ids in target_members.items():
+            representative = representatives[target_identity]
+            downloaded = representative.download
+            if downloaded is None:
+                raise AssertionError("successful webpage group has no download")
+
+            group_final = target_final_urls[target_identity]
+            source_urls: list[str] = []
+            prior = previous.get(target_identity)
+            if prior is not None:
+                source_urls.extend(page_record_source_urls(prior))
+
+            candidate_ids = list(member_ids)
+            if (
+                target_identity in candidates
+                and target_identity not in candidate_ids
+                and successful_final.get(target_identity, group_final) == group_final
+            ):
+                candidate_ids.append(target_identity)
+            covered_candidates.update(candidate_ids)
+
+            for member_id in member_ids:
+                member_prior = previous.get(member_id)
+                if member_prior is not None:
+                    source_urls.extend(page_record_source_urls(member_prior))
+                source_urls.extend(candidates[member_id].source_urls)
+                if member_id != target_identity:
+                    records.pop(member_id, None)
+            if target_identity in candidates:
+                source_urls.extend(candidates[target_identity].source_urls)
+
+            relpath = webpage_relpath(target_identity)
+            target = self.root / self.config.webpages.storage_path / relpath
+            commit_candidate = temporary_sibling(target)
+            try:
+                shutil.copyfile(downloaded.target_path, commit_candidate)
+                changed = commit_download(
+                    commit_candidate,
+                    target,
+                    downloaded.sha256,
+                )
+            finally:
+                commit_candidate.unlink(missing_ok=True)
+                downloaded.target_path.unlink(missing_ok=True)
+            for member_id in member_ids:
+                member_download = outcomes[member_id].download
+                if member_download is None or member_download is downloaded:
+                    continue
+                if member_download.sha256 != downloaded.sha256:
+                    logger.warning(
+                        "Webpage aliases returned different content for %s; "
+                        "keeping the first successful response",
+                        downloaded.final_url,
+                    )
+                member_download.target_path.unlink(missing_ok=True)
+
+            path = webpage_manifest_path(
+                self.config.webpages.storage_path,
+                relpath,
+            )
+            previous_updated_at = (prior or {}).get("updated_at")
+            updated_at = (
+                downloaded.fetched_at
+                if changed or previous_updated_at is None
+                else previous_updated_at
+            )
+            record = {
+                "source_url": target_identity,
+                "final_url": downloaded.final_url,
+                "path": path,
+                "content_type": downloaded.content_type,
+                "sha256": downloaded.sha256,
+                "bytes": downloaded.byte_count,
+                "response_headers": dict(downloaded.response_headers),
+                "downloader": representative.task.preset_name,
+                "backend": downloaded.backend_name,
+                "user_agent": downloaded.metadata.get("user_agent"),
+                "user_agent_strategy": downloaded.metadata.get(
+                    "user_agent_strategy"
+                ),
+                "first_feed_url": representative.task.first_feed_url,
+                "updated_at": updated_at,
+                "fetched_at": downloaded.fetched_at,
+                "changed": changed,
+                "status": "ok",
+            }
+            self._add_page_aliases(record, source_urls)
+            records[target_identity] = record
+            if changed:
+                changed_paths.append(path)
+
+        for identity_url, candidate in candidates.items():
+            if identity_url in covered_candidates:
+                continue
+            prior = previous.get(identity_url)
+            outcome = outcomes.get(identity_url)
             if outcome is None:
                 if not self._valid_page_cache(prior):
                     raise AssertionError("skipped webpage has no valid cache")
                 record = dict(prior or {})
                 record.pop("last_error", None)
+                self._add_page_aliases(record, candidate.source_urls)
                 record.update(
                     {
                         "changed": False,
                         "status": "skipped",
-                        "skip_reason": candidate.refresh_policy,
+                        "skip_reason": candidate.first_task.refresh_policy,
                     }
                 )
-                records[canonical_url] = record
+                records[identity_url] = record
                 continue
 
             task = outcome.task
             if outcome.download is not None:
-                downloaded = outcome.download
-                path = webpage_manifest_path(
-                    self.config.webpages.storage_path,
-                    task.relpath,
-                )
-                previous_updated_at = (prior or {}).get("updated_at")
-                updated_at = (
-                    downloaded.fetched_at
-                    if downloaded.changed or previous_updated_at is None
-                    else previous_updated_at
-                )
-                record = {
-                    "source_url": canonical_url,
-                    "final_url": downloaded.final_url,
-                    "path": path,
-                    "content_type": downloaded.content_type,
-                    "sha256": downloaded.sha256,
-                    "bytes": downloaded.byte_count,
-                    "response_headers": dict(downloaded.response_headers),
-                    "downloader": task.preset_name,
-                    "backend": downloaded.backend_name,
-                    "user_agent": downloaded.metadata.get("user_agent"),
-                    "user_agent_strategy": downloaded.metadata.get(
-                        "user_agent_strategy"
-                    ),
-                    "first_feed_url": task.first_feed_url,
-                    "updated_at": updated_at,
-                    "fetched_at": downloaded.fetched_at,
-                    "changed": downloaded.changed,
-                    "status": "ok",
-                }
-                records[canonical_url] = record
-                if downloaded.changed:
-                    changed_paths.append(path)
-            elif self._valid_page_cache(prior):
+                raise AssertionError("successful webpage outcome was not grouped")
+            if self._valid_page_cache(prior):
                 record = dict(prior or {})
                 record.pop("skip_reason", None)
+                self._add_page_aliases(record, candidate.source_urls)
                 record.update(
                     {
                         "changed": False,
@@ -517,10 +715,10 @@ class SyncEngine:
                         "last_error": str(outcome.error),
                     }
                 )
-                records[canonical_url] = record
+                records[identity_url] = record
             else:
-                records[canonical_url] = {
-                    "source_url": canonical_url,
+                record = {
+                    "source_url": identity_url,
                     "downloader": task.preset_name,
                     "backend": self.manager.backend_name(task.preset_name),
                     "first_feed_url": task.first_feed_url,
@@ -528,6 +726,8 @@ class SyncEngine:
                     "status": "failed",
                     "last_error": str(outcome.error),
                 }
+                self._add_page_aliases(record, candidate.source_urls)
+                records[identity_url] = record
         obsolete = (
             {
                 url: dict(record)
@@ -772,21 +972,43 @@ class SyncEngine:
                 feed_outcomes,
                 previous_pages,
             )
-            page_outcomes = await self._fetch_pages(page_tasks)
             if self.config.archive_current_only:
-                protected_pages, webpage_cleanup_safe = self._protected_page_urls(
-                    feed_outcomes,
-                    previous_feeds,
+                protected_pages, webpage_cleanup_safe = (
+                    self._protected_page_urls(
+                        feed_outcomes,
+                        previous_feeds,
+                    )
                 )
             else:
                 protected_pages, webpage_cleanup_safe = set(), True
-            page_records, changed_pages, obsolete_pages = self._update_pages(
-                page_candidates,
-                page_outcomes,
-                previous_pages,
-                protected_pages,
-                webpage_cleanup_safe,
-            )
+
+            if page_tasks:
+                with tempfile.TemporaryDirectory(
+                    prefix=".rssync-pages-",
+                    dir=self.root,
+                ) as staging_directory:
+                    page_outcomes = await self._fetch_pages(
+                        page_tasks,
+                        Path(staging_directory),
+                    )
+                    page_records, changed_pages, obsolete_pages = (
+                        self._update_pages(
+                            page_candidates,
+                            page_outcomes,
+                            previous_pages,
+                            protected_pages,
+                            webpage_cleanup_safe,
+                        )
+                    )
+            else:
+                page_outcomes = {}
+                page_records, changed_pages, obsolete_pages = self._update_pages(
+                    page_candidates,
+                    page_outcomes,
+                    previous_pages,
+                    protected_pages,
+                    webpage_cleanup_safe,
+                )
 
             feed_records: list[dict[str, Any]] = []
             changed_feeds: list[str] = []

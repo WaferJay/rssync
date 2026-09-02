@@ -140,11 +140,21 @@ as a cache entry. A feed can override the global strategy:
 ```
 
 When multiple feeds reference the same canonical URL, rssync downloads it once
-if any referencing feed's strategy requests a refresh. The first such feed in
-configuration order selects the webpage downloader. A policy-skipped page keeps
-its original timestamps and download metadata and is reported with `skipped`
-status in `pages.json`. If `storage-path` changes, a skipped archive remains at
-its recorded path; newly downloaded pages use the new storage path.
+if any referencing feed's strategy requests a refresh. URL identity normalizes
+scheme and host casing, default ports, fragments, RFC 3986 dot segments, and
+percent encoding of unreserved characters. It deliberately preserves trailing
+slashes, repeated slashes, and query parameter order because they can identify
+different resources.
+
+Different source URLs that redirect to the same canonical final URL share one
+manifest record and archive file. Their first synchronization may still make
+multiple requests because the redirect destination is not known beforehand;
+later runs use the recorded aliases to make one request. The first successful
+page in feed configuration order supplies the stored response and downloader
+metadata. A policy-skipped page keeps its original timestamps and download
+metadata and is reported with `skipped` status in `pages.json`. If
+`storage-path` changes, a skipped archive remains at its recorded path; newly
+downloaded pages use the new storage path.
 
 Refresh decisions use the `WebpageRefreshStrategy` protocol and
 `WebpageRefreshRegistry` in `rssync.webpage_refresh`. Applications can register
@@ -288,7 +298,9 @@ presets. When Atom output is enabled, each applicable feed record also reports
 `atom_path`, `atom_updated_at`, `atom_changed`, and `atom_status`; the sync record
 lists changed Atom paths in `changed_atoms`. `pages.json` records archived paths,
 canonical source and final URLs, response headers, SHA-256 hashes, downloader
-metadata, timestamps, and current status.
+metadata, timestamps, and current status. When several source URLs identify one
+page, the stable primary remains in `source_url` and the other entry URLs appear
+in the optional `aliases` array; all of them resolve to the same `path`.
 
 Manifest paths are root-relative and never contain a URL scheme or authority. RSS paths
 look like `/feeds/example.com/feed.xml`; webpage paths look like
@@ -298,8 +310,9 @@ root after removing the leading `/`.
 
 A downstream generator can still resolve an item link against the corresponding
 `feeds[].final_url`, canonicalize it, and find the matching
-`pages[].source_url`. The optional generated Atom provides this mapping directly
-without requiring a publication origin in the rssync configuration.
+`pages[].source_url` or `pages[].aliases` value. The optional generated Atom
+provides this mapping directly without requiring a publication origin in the
+rssync configuration.
 
 If an RSS fetch or parse fails, the previous original feed is retained. If a
 webpage refresh fails, a valid existing archive is reported with `cached`
@@ -307,4 +320,6 @@ status; without a cache, it is reported as `failed`. RSS links are unaffected.
 An existing Atom document is regenerated from the last usable RSS when possible,
 or retained unchanged if that RSS can no longer be parsed.
 Historical webpage and Atom files are not automatically deleted unless
-`archive-current-only` is enabled.
+`archive-current-only` is enabled. Existing page records are not scanned or
+rewritten solely to apply newer URL identity rules. When a legacy URL is linked
+again, its archive is reused and its record is upgraded lazily.

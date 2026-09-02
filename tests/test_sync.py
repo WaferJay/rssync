@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 
 from rssync.config import parse_config
 from rssync.downloaders.registry import DownloaderRegistry
+from rssync.storage import webpage_relpath
 from rssync.sync import SyncEngine
 from rssync.webpage_refresh import default_webpage_refresh_registry
 from tests.fakes import FakeBackendFactory, FakeReply
@@ -114,6 +115,412 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
                     ("webpage", page_url, "default"),
                 ],
             )
+
+    async def test_equivalent_page_urls_are_normalized_before_download(self):
+        feed_url = "https://example.com/feed.xml"
+        encoded_url = "https://EXAMPLE.com:443/a/../%7ealice#profile"
+        canonical_url = "https://example.com/~alice"
+        factory = FakeBackendFactory(
+            {
+                feed_url: FakeReply(rss_with_links(encoded_url, canonical_url)),
+                canonical_url: FakeReply(b"<html>same</html>", "text/html"),
+            }
+        )
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            self.assertEqual(
+                [call for call in factory.calls if call[0] == "webpage"],
+                [("webpage", canonical_url, "default")],
+            )
+            self.assertEqual(len(result["pages"]["pages"]), 1)
+            record = result["pages"]["pages"][0]
+            self.assertEqual(record["source_url"], canonical_url)
+            self.assertNotIn("aliases", record)
+
+    async def test_redirect_aliases_share_one_record_and_archive(self):
+        feed_url = "https://feed.example/feed.xml"
+        first_url = "https://example.com/start-a"
+        second_url = "https://example.com/start-b"
+        final_url = "https://example.com/final"
+        rss = rss_with_links(first_url, second_url)
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first_factory = FakeBackendFactory(
+                {
+                    feed_url: FakeReply(rss),
+                    first_url: FakeReply(
+                        b"<html>shared</html>",
+                        "text/html",
+                        final_url=final_url,
+                    ),
+                    second_url: FakeReply(
+                        b"<html>shared</html>",
+                        "text/html",
+                        final_url=final_url,
+                    ),
+                }
+            )
+            first = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(first_factory),
+                clock=lambda: 100,
+            ).run()
+
+            self.assertEqual(
+                [call for call in first_factory.calls if call[0] == "webpage"],
+                [
+                    ("webpage", first_url, "default"),
+                    ("webpage", second_url, "default"),
+                ],
+            )
+            self.assertEqual(len(first["pages"]["pages"]), 1)
+            record = first["pages"]["pages"][0]
+            self.assertEqual(record["source_url"], first_url)
+            self.assertEqual(record["aliases"], [second_url])
+            self.assertEqual(record["final_url"], final_url)
+            archived = Path(directory, record["path"].removeprefix("/"))
+            self.assertEqual(archived.read_bytes(), b"<html>shared</html>")
+            self.assertEqual(
+                list(Path(directory, "pages").rglob("*.html")),
+                [archived],
+            )
+
+            second_factory = FakeBackendFactory(
+                {
+                    feed_url: FakeReply(rss),
+                    first_url: FakeReply(
+                        b"<html>shared</html>",
+                        "text/html",
+                        final_url=final_url,
+                    ),
+                }
+            )
+            second = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+                clock=lambda: 200,
+            ).run()
+
+            self.assertEqual(
+                [call for call in second_factory.calls if call[0] == "webpage"],
+                [("webpage", first_url, "default")],
+            )
+            self.assertEqual(len(second["pages"]["pages"]), 1)
+            self.assertEqual(second["pages"]["pages"][0]["aliases"], [second_url])
+            self.assertFalse(second["pages"]["pages"][0]["changed"])
+
+    async def test_atom_resolves_all_redirect_aliases_to_one_archive(self):
+        feed_url = "https://feed.example/feed.xml"
+        first_url = "https://example.com/start-a"
+        second_url = "https://example.com/start-b"
+        final_url = "https://example.com/final"
+        factory = FakeBackendFactory(
+            {
+                feed_url: FakeReply(rss_with_links(first_url, second_url)),
+                first_url: FakeReply(
+                    b"<html>shared</html>",
+                    "text/html",
+                    final_url=final_url,
+                ),
+                second_url: FakeReply(
+                    b"<html>shared</html>",
+                    "text/html",
+                    final_url=final_url,
+                ),
+            }
+        )
+        config = parse_config(
+            {
+                "webpages": {"atom": {}},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            atom_path = Path(
+                directory,
+                result["feeds"]["feeds"][0]["atom_path"].removeprefix("/"),
+            )
+            root = ET.fromstring(atom_path.read_bytes())
+            namespace = {"atom": "http://www.w3.org/2005/Atom"}
+            hrefs = [
+                link.attrib["href"]
+                for link in root.findall(
+                    "atom:entry/atom:link[@rel='alternate']",
+                    namespace,
+                )
+            ]
+            self.assertEqual(len(hrefs), 2)
+            self.assertEqual(len(set(hrefs)), 1)
+
+    async def test_current_only_keeps_page_until_all_aliases_disappear(self):
+        feed_url = "https://feed.example/feed.xml"
+        first_url = "https://example.com/start-a"
+        second_url = "https://example.com/start-b"
+        final_url = "https://example.com/final"
+        config = parse_config(
+            {
+                "archive-current-only": True,
+                "webpages": {"refresh-policy": "missing-only"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(
+                                rss_with_links(first_url, second_url)
+                            ),
+                            first_url: FakeReply(
+                                b"<html>shared</html>",
+                                "text/html",
+                                final_url=final_url,
+                            ),
+                            second_url: FakeReply(
+                                b"<html>shared</html>",
+                                "text/html",
+                                final_url=final_url,
+                            ),
+                        }
+                    )
+                ),
+            ).run()
+            record = first["pages"]["pages"][0]
+            archived = Path(directory, record["path"].removeprefix("/"))
+
+            second_factory = FakeBackendFactory(
+                {feed_url: FakeReply(rss_with_links(second_url))}
+            )
+            second = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+            ).run()
+
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            self.assertEqual(len(second["pages"]["pages"]), 1)
+            self.assertTrue(archived.is_file())
+
+            third = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(rss_with_links())})
+                ),
+            ).run()
+
+            self.assertEqual(third["pages"]["pages"], [])
+            self.assertFalse(archived.exists())
+
+    async def test_redirect_alias_content_uses_first_feed_order(self):
+        feed_url = "https://feed.example/feed.xml"
+        first_url = "https://example.com/slow-first"
+        second_url = "https://example.com/fast-second"
+        final_url = "https://example.com/final"
+        factory = FakeBackendFactory(
+            {
+                feed_url: FakeReply(rss_with_links(first_url, second_url)),
+                first_url: FakeReply(
+                    b"<html>first</html>",
+                    "text/html",
+                    final_url=final_url,
+                    delay=0.02,
+                ),
+                second_url: FakeReply(
+                    b"<html>second</html>",
+                    "text/html",
+                    final_url=final_url,
+                ),
+            }
+        )
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertLogs("rssync.sync", level="WARNING") as logs:
+                result = await SyncEngine(
+                    config,
+                    root=directory,
+                    registry=registry_with(factory),
+                ).run()
+
+            record = result["pages"]["pages"][0]
+            archived = Path(directory, record["path"].removeprefix("/"))
+            self.assertEqual(archived.read_bytes(), b"<html>first</html>")
+            self.assertTrue(
+                any("returned different content" in message for message in logs.output)
+            )
+
+    async def test_known_final_url_reuses_cached_redirect_archive(self):
+        feed_url = "https://feed.example/feed.xml"
+        source_url = "https://example.com/start"
+        final_url = "https://example.com/final"
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "missing-only"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(rss_with_links(source_url)),
+                            source_url: FakeReply(
+                                b"<html>page</html>",
+                                "text/html",
+                                final_url=final_url,
+                            ),
+                        }
+                    )
+                ),
+            ).run()
+            second_factory = FakeBackendFactory(
+                {feed_url: FakeReply(rss_with_links(final_url))}
+            )
+
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+            ).run()
+
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            record = result["pages"]["pages"][0]
+            self.assertEqual(record["source_url"], source_url)
+            self.assertEqual(record["aliases"], [final_url])
+
+    async def test_invalid_final_urls_are_not_used_for_alias_merging(self):
+        feed_url = "https://feed.example/feed.xml"
+        first_url = "https://example.com/start-a"
+        second_url = "https://example.com/start-b"
+        factory = FakeBackendFactory(
+            {
+                feed_url: FakeReply(rss_with_links(first_url, second_url)),
+                first_url: FakeReply(
+                    b"<html>first</html>",
+                    "text/html",
+                    final_url="/relative-final",
+                ),
+                second_url: FakeReply(
+                    b"<html>second</html>",
+                    "text/html",
+                    final_url="/relative-final",
+                ),
+            }
+        )
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            self.assertEqual(len(result["pages"]["pages"]), 2)
+            self.assertEqual(
+                len(list(Path(directory, "pages").rglob("*.html"))),
+                2,
+            )
+
+    async def test_referenced_legacy_url_is_lazily_upgraded_in_place(self):
+        feed_url = "https://example.com/feed.xml"
+        legacy_url = "https://example.com/%7Ealice"
+        canonical_url = "https://example.com/~alice"
+        relpath = webpage_relpath(legacy_url)
+        public_path = f"/pages/{relpath}"
+        config = parse_config(
+            {
+                "webpages": {"refresh-policy": "missing-only"},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            archived = Path(directory, public_path.removeprefix("/"))
+            archived.parent.mkdir(parents=True)
+            archived.write_bytes(b"<html>legacy</html>")
+            Path(directory, "pages.json").write_text(
+                json.dumps(
+                    {
+                        "pages": [
+                            {
+                                "source_url": legacy_url,
+                                "final_url": canonical_url,
+                                "path": public_path,
+                                "status": "ok",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            factory = FakeBackendFactory(
+                {feed_url: FakeReply(rss_with_links(legacy_url))}
+            )
+
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            self.assertEqual(factory.calls, [("rss", feed_url, "default")])
+            self.assertEqual(len(result["pages"]["pages"]), 1)
+            record = result["pages"]["pages"][0]
+            self.assertEqual(record["source_url"], legacy_url)
+            self.assertEqual(record["aliases"], [canonical_url])
+            self.assertEqual(record["path"], public_path)
+            self.assertEqual(archived.read_bytes(), b"<html>legacy</html>")
 
     async def test_atom_feed_is_generated_with_stable_relative_links(self):
         feed_url = "https://example.com/news/feed.xml"

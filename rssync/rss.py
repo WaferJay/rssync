@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Collection
 from dataclasses import dataclass, field
@@ -10,10 +11,59 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 DEFAULT_RSS_IGNORE_TAGS = ("lastBuildDate",)
+_UNRESERVED_URL_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+_PERCENT_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
 
 
 class RssParseError(ValueError):
     """Raised when downloaded data is not a usable RSS document."""
+
+
+def _normalize_percent_encoding(value: str) -> str:
+    """Normalize valid percent escapes without decoding reserved characters."""
+
+    def replace(match: re.Match[str]) -> str:
+        character = chr(int(match.group(1), 16))
+        if character in _UNRESERVED_URL_CHARACTERS:
+            return character
+        return f"%{match.group(1).upper()}"
+
+    return _PERCENT_ESCAPE.sub(replace, value)
+
+
+def _remove_dot_segments(path: str) -> str:
+    """Remove RFC 3986 dot segments while preserving other slash semantics."""
+
+    remaining = path
+    output = ""
+    while remaining:
+        if remaining.startswith("../"):
+            remaining = remaining[3:]
+        elif remaining.startswith("./"):
+            remaining = remaining[2:]
+        elif remaining.startswith("/./"):
+            remaining = remaining[2:]
+        elif remaining == "/.":
+            remaining = "/"
+        elif remaining.startswith("/../"):
+            remaining = remaining[3:]
+            output = output.rsplit("/", 1)[0]
+        elif remaining == "/..":
+            remaining = "/"
+            output = output.rsplit("/", 1)[0]
+        elif remaining in {".", ".."}:
+            remaining = ""
+        else:
+            separator = remaining.find("/", 1 if remaining.startswith("/") else 0)
+            if separator == -1:
+                output += remaining
+                remaining = ""
+            else:
+                output += remaining[:separator]
+                remaining = remaining[separator:]
+    return output
 
 
 def canonicalize_http_url(url: str) -> str | None:
@@ -37,7 +87,9 @@ def canonicalize_http_url(url: str) -> str | None:
             (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
         ):
             hostname = f"{hostname}:{port}"
-        return urlunsplit((scheme, hostname, parsed.path or "/", parsed.query, ""))
+        path = _remove_dot_segments(_normalize_percent_encoding(parsed.path or "/"))
+        query = _normalize_percent_encoding(parsed.query)
+        return urlunsplit((scheme, hostname, path, query, ""))
     except (UnicodeError, ValueError):
         return None
 
