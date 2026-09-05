@@ -25,6 +25,7 @@ from rssync.manifests import (
     index_page_records,
     load_feed_records,
     load_page_records,
+    page_record_identity_url,
     page_record_source_urls,
 )
 from rssync.rss import RssDocument, canonicalize_http_url, rss_documents_equal
@@ -208,22 +209,48 @@ class SyncEngine:
         candidates: dict[str, PageCandidate] = {}
         tasks: dict[str, PageTask] = {}
         cache_validity: dict[str, bool] = {}
-        previous_by_url = index_page_records(previous_pages.values())
+
+        # Keep separate indexes because query significance is configurable per
+        # feed. When several legacy records collapse to one queryless identity,
+        # prefer an archive that still exists on disk.
+        previous_by_url: dict[bool, dict[str, Mapping[str, Any]]] = {
+            False: {},
+            True: {},
+        }
         for record in previous_pages.values():
-            source_url = record.get("source_url")
-            if (
-                not isinstance(source_url, str)
-                or canonicalize_http_url(source_url) is None
-            ):
-                continue
+            record_urls = list(page_record_source_urls(record))
             final_url = record.get("final_url")
-            canonical_final = (
-                canonicalize_http_url(final_url)
-                if isinstance(final_url, str)
-                else None
-            )
-            if canonical_final is not None:
-                previous_by_url.setdefault(canonical_final, record)
+            if isinstance(final_url, str):
+                record_urls.append(final_url)
+            for ignore_query, index_by_url in previous_by_url.items():
+                for record_url in record_urls:
+                    identity = canonicalize_http_url(
+                        record_url,
+                        ignore_query=ignore_query,
+                    )
+                    if identity is None:
+                        continue
+                    existing = index_by_url.get(identity)
+                    if existing is None or (
+                        not self._valid_page_cache(existing)
+                        and self._valid_page_cache(record)
+                    ):
+                        index_by_url[identity] = record
+
+        # An exact URL remains one page even when two feeds use different
+        # query settings. If that exact URL occurs in an ignore-query feed, all
+        # of its occurrences participate in that feed's queryless group.
+        query_ignored_urls: set[str] = set()
+        for index, feed in enumerate(self.config.feeds):
+            document = feed_outcomes[index].document
+            if (
+                feed.download_webpages
+                and feed.webpage_ignore_query
+                and document is not None
+            ):
+                query_ignored_urls.update(
+                    link.canonical_url for link in document.links
+                )
         for index, feed in enumerate(self.config.feeds):
             outcome = feed_outcomes[index]
             if not feed.download_webpages or outcome.document is None:
@@ -232,18 +259,31 @@ class SyncEngine:
                 raise AssertionError("parsed RSS has no change result")
             strategy = self.refresh_strategies[feed.webpage_refresh_policy]
             for link in outcome.document.links:
-                prior = previous_by_url.get(link.canonical_url)
+                ignore_query = (
+                    feed.webpage_ignore_query
+                    or link.canonical_url in query_ignored_urls
+                )
+                link_identity = canonicalize_http_url(
+                    link.canonical_url,
+                    ignore_query=ignore_query,
+                )
+                if link_identity is None:
+                    raise AssertionError("parsed RSS link has no HTTP identity")
+                prior = previous_by_url[ignore_query].get(link_identity)
+                prior_identity = (
+                    page_record_identity_url(prior) if prior is not None else None
+                )
                 identity_url = (
-                    prior["source_url"]
-                    if prior is not None
-                    and isinstance(prior.get("source_url"), str)
-                    else link.canonical_url
+                    prior_identity
+                    if prior_identity is not None
+                    and canonicalize_http_url(prior_identity) is not None
+                    else link_identity
                 )
                 task = PageTask(
                     canonical_url=link.canonical_url,
                     preset_name=feed.webpage_downloader,
                     first_feed_url=feed.url,
-                    relpath=webpage_relpath(link.canonical_url),
+                    relpath=webpage_relpath(identity_url),
                     refresh_policy=feed.webpage_refresh_policy,
                 )
                 candidate = candidates.get(identity_url)
@@ -272,10 +312,10 @@ class SyncEngine:
         self,
         feed_outcomes: Mapping[int, FeedOutcome],
         previous_feeds: Mapping[str, Mapping[str, Any]],
-    ) -> tuple[set[str], bool]:
+    ) -> tuple[set[tuple[bool, str]], bool]:
         """Recover webpage references from retained RSS after fetch failures."""
 
-        protected: set[str] = set()
+        protected: set[tuple[bool, str]] = set()
         for index, feed in enumerate(self.config.feeds):
             outcome = feed_outcomes[index]
             if not feed.download_webpages or outcome.document is not None:
@@ -305,7 +345,13 @@ class SyncEngine:
                     exc_info=True,
                 )
                 return set(), False
-            protected.update(link.canonical_url for link in document.links)
+            for link in document.links:
+                identity = canonicalize_http_url(
+                    link.canonical_url,
+                    ignore_query=feed.webpage_ignore_query,
+                )
+                if identity is not None:
+                    protected.add((feed.webpage_ignore_query, identity))
         return protected, True
 
     async def _fetch_pages(
@@ -369,13 +415,15 @@ class SyncEngine:
     @staticmethod
     def _page_record_matches(
         record: Mapping[str, Any],
-        canonical_urls: Collection[str],
+        identities: Collection[tuple[bool, str]],
     ) -> bool:
-        """Return whether any primary URL or alias is in a canonical URL set."""
+        """Return whether a record matches any configured URL identity."""
 
         return any(
-            canonicalize_http_url(source_url) in canonical_urls
+            canonicalize_http_url(source_url, ignore_query=ignore_query)
+            == identity
             for source_url in page_record_source_urls(record)
+            for ignore_query, identity in identities
         )
 
     def _atom_document(
@@ -513,7 +561,7 @@ class SyncEngine:
         candidates: Mapping[str, PageCandidate],
         outcomes: Mapping[str, PageOutcome],
         previous: Mapping[str, Mapping[str, Any]],
-        protected_urls: Collection[str],
+        protected_urls: Collection[tuple[bool, str]],
         cleanup_safe: bool,
     ) -> tuple[
         dict[str, dict[str, Any]],
@@ -655,8 +703,18 @@ class SyncEngine:
                 if changed or previous_updated_at is None
                 else previous_updated_at
             )
+            primary_source = (prior or {}).get("source_url")
+            if not isinstance(primary_source, str):
+                primary_source = next(
+                    (
+                        source_url
+                        for source_url in source_urls
+                        if canonicalize_http_url(source_url) is not None
+                    ),
+                    target_identity,
+                )
             record = {
-                "source_url": target_identity,
+                "source_url": primary_source,
                 "final_url": downloaded.final_url,
                 "path": path,
                 "content_type": downloaded.content_type,
@@ -675,6 +733,8 @@ class SyncEngine:
                 "changed": changed,
                 "status": "ok",
             }
+            if target_identity != primary_source:
+                record["identity_url"] = target_identity
             self._add_page_aliases(record, source_urls)
             records[target_identity] = record
             if changed:
@@ -717,8 +777,12 @@ class SyncEngine:
                 )
                 records[identity_url] = record
             else:
+                primary_source = next(
+                    iter(candidate.source_urls),
+                    identity_url,
+                )
                 record = {
-                    "source_url": identity_url,
+                    "source_url": primary_source,
                     "downloader": task.preset_name,
                     "backend": self.manager.backend_name(task.preset_name),
                     "first_feed_url": task.first_feed_url,
@@ -726,6 +790,8 @@ class SyncEngine:
                     "status": "failed",
                     "last_error": str(outcome.error),
                 }
+                if identity_url != primary_source:
+                    record["identity_url"] = identity_url
                 self._add_page_aliases(record, candidate.source_urls)
                 records[identity_url] = record
         obsolete = (
@@ -772,7 +838,7 @@ class SyncEngine:
 
     def _page_cleanup_target(
         self,
-        source_url: str,
+        identity_url: str,
         record: Mapping[str, Any],
     ) -> tuple[PurePosixPath, Path, Path] | None:
         """Validate a manifest-owned webpage path and recover its storage root."""
@@ -785,14 +851,14 @@ class SyncEngine:
             logger.warning("Ignoring unsafe obsolete webpage path: %s", path)
             return None
 
-        expected = PurePosixPath(webpage_relpath(source_url))
+        expected = PurePosixPath(webpage_relpath(identity_url))
         expected_length = len(expected.parts)
         if (
             len(relative.parts) < expected_length
             or relative.parts[-expected_length:] != expected.parts
         ):
             logger.warning(
-                "Ignoring obsolete webpage path that does not match its URL: %s",
+                "Ignoring obsolete webpage path that does not match its identity: %s",
                 path,
             )
             return None
@@ -893,12 +959,12 @@ class SyncEngine:
             self._remove_archive_file(target, managed_root)
 
         current_page_paths: set[PurePosixPath] = set()
-        for source_url, record in current_pages.items():
-            cleanup_target = self._page_cleanup_target(source_url, record)
+        for identity_url, record in current_pages.items():
+            cleanup_target = self._page_cleanup_target(identity_url, record)
             if cleanup_target is not None:
                 current_page_paths.add(cleanup_target[0])
-        for source_url, record in obsolete_pages.items():
-            cleanup_target = self._page_cleanup_target(source_url, record)
+        for identity_url, record in obsolete_pages.items():
+            cleanup_target = self._page_cleanup_target(identity_url, record)
             if cleanup_target is None:
                 continue
             relative, target, managed_root = cleanup_target
@@ -946,6 +1012,7 @@ class SyncEngine:
             "webpage_downloader": feed.webpage_downloader,
             "webpage_backend": self.manager.backend_name(feed.webpage_downloader),
             "webpage_refresh_policy": feed.webpage_refresh_policy,
+            "webpage_ignore_query": feed.webpage_ignore_query,
             "download_webpages": feed.download_webpages,
             "change_detection": {
                 "ignore_tags": list(feed.change_detection.ignore_tags)

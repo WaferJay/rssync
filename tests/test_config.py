@@ -21,6 +21,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.webpages.refresh_policy, "always")
         self.assertIsNone(config.webpages.atom)
         self.assertEqual(config.feeds[0].webpage_refresh_policy, "always")
+        self.assertFalse(config.feeds[0].webpage_ignore_query)
         self.assertFalse(config.archive_current_only)
         self.assertEqual(config.downloaders["default"].backend, "httpx")
         self.assertTrue(config.downloaders["default"].options["http2"])
@@ -213,6 +214,44 @@ class ConfigTest(unittest.TestCase):
             config.feeds[1].webpage_refresh_policy,
             "missing-only",
         )
+
+    def test_feed_ignore_query_defaults_to_false_and_can_be_enabled(self):
+        config = parse_config(
+            {
+                "feeds": [
+                    {"url": "https://example.com/default.xml"},
+                    {
+                        "url": "https://example.com/query-ignored.xml",
+                        "webpage-ignore-query": True,
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(config.feeds[0].webpage_ignore_query)
+        self.assertTrue(config.feeds[1].webpage_ignore_query)
+
+    def test_feed_ignore_query_requires_a_boolean(self):
+        with self.assertRaisesRegex(ConfigError, "must be a boolean"):
+            parse_config(
+                {
+                    "feeds": [
+                        {
+                            "url": "https://example.com/feed.xml",
+                            "webpage-ignore-query": 1,
+                        }
+                    ]
+                }
+            )
+
+    def test_global_ignore_query_is_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "unknown webpages field"):
+            parse_config(
+                {
+                    "webpages": {"ignore-query": True},
+                    "feeds": [{"url": "https://example.com/feed.xml"}],
+                }
+            )
 
     def test_unknown_refresh_policies_are_rejected(self):
         invalid_configs = [

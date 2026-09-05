@@ -32,6 +32,19 @@ def page_record_source_urls(record: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(urls))
 
 
+def page_record_identity_url(record: Mapping[str, Any]) -> str | None:
+    """Return the URL identity used for a page record's archive path."""
+
+    identity_url = record.get("identity_url")
+    if (
+        isinstance(identity_url, str)
+        and canonicalize_http_url(identity_url) is not None
+    ):
+        return identity_url
+    source_url = record.get("source_url")
+    return source_url if isinstance(source_url, str) else None
+
+
 def index_page_records(
     records: Iterable[Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
@@ -82,7 +95,7 @@ def load_feed_records(path: str | Path = "feeds.json") -> dict[str, dict[str, An
 
 
 def load_page_records(path: str | Path = "pages.json") -> dict[str, dict[str, Any]]:
-    """Load and migrate webpage records indexed by canonical source URL."""
+    """Load and migrate webpage records indexed by their URL identity."""
 
     manifest = _read_manifest(path, "webpage")
     records = manifest.get("pages", [])
@@ -96,6 +109,16 @@ def load_page_records(path: str | Path = "pages.json") -> dict[str, dict[str, An
             continue
         normalized = dict(record)
         normalized.pop("local_url", None)
+        stored_identity = normalized.get("identity_url")
+        identity_url = page_record_identity_url(normalized)
+        if identity_url is None:
+            continue
+        if (
+            identity_url == normalized["source_url"]
+            or not isinstance(stored_identity, str)
+            or canonicalize_http_url(stored_identity) is None
+        ):
+            normalized.pop("identity_url", None)
         aliases = normalized.get("aliases")
         if isinstance(aliases, list):
             normalized_aliases: list[str] = []
@@ -120,7 +143,7 @@ def load_page_records(path: str | Path = "pages.json") -> dict[str, dict[str, An
                 normalized.pop("path", None)
             else:
                 normalized["path"] = root_relative_manifest_path(relative.as_posix())
-        migrated[normalized["source_url"]] = normalized
+        migrated[identity_url] = normalized
     return migrated
 
 

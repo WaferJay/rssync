@@ -63,6 +63,8 @@ accepted. Each feed supports:
 - `webpage-downloader`: webpage preset; defaults to `default`.
 - `webpage-refresh-policy`: optional override for the global webpage refresh
   policy.
+- `webpage-ignore-query`: whether query strings take part in webpage identity;
+  defaults to `false`.
 - `change-detection`: optional per-feed override for RSS comparison rules.
 
 Archived webpages are stored under `pages/` by default. The location can be
@@ -143,8 +145,20 @@ When multiple feeds reference the same canonical URL, rssync downloads it once
 if any referencing feed's strategy requests a refresh. URL identity normalizes
 scheme and host casing, default ports, fragments, RFC 3986 dot segments, and
 percent encoding of unreserved characters. It deliberately preserves trailing
-slashes, repeated slashes, and query parameter order because they can identify
-different resources.
+slashes and repeated slashes. By default, it also preserves the complete query
+string, including parameter order, because queries can identify different
+resources.
+
+Set `webpage-ignore-query` to `true` on a feed when its item query strings do
+not distinguish pages. The query is then excluded from deduplication and the
+hash for new archive identities, while the first full URL in feed and item
+order is still used for the HTTP request. Other query variants are recorded as
+aliases of the same page. When variants occur across feeds, each participating
+feed must enable the option.
+
+This option ignores the entire query, so it should not be enabled for feeds
+whose item path is shared by genuinely different query-selected pages. Existing
+matching archives are reused at their recorded paths rather than bulk-renamed.
 
 Different source URLs that redirect to the same canonical final URL share one
 manifest record and archive file. Their first synchronization may still make
@@ -300,7 +314,9 @@ lists changed Atom paths in `changed_atoms`. `pages.json` records archived paths
 canonical source and final URLs, response headers, SHA-256 hashes, downloader
 metadata, timestamps, and current status. When several source URLs identify one
 page, the stable primary remains in `source_url` and the other entry URLs appear
-in the optional `aliases` array; all of them resolve to the same `path`.
+in the optional `aliases` array; all of them resolve to the same `path`. When
+that path is based on an identity different from `source_url`, such as a URL
+without its ignored query, the identity is recorded in `identity_url`.
 
 Manifest paths are root-relative and never contain a URL scheme or authority. RSS paths
 look like `/feeds/example.com/feed.xml`; webpage paths look like

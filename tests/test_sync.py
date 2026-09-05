@@ -149,6 +149,270 @@ class SyncEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["source_url"], canonical_url)
             self.assertNotIn("aliases", record)
 
+    async def test_ignore_query_deduplicates_pages_across_feeds(self):
+        first_feed = "https://one.example/feed.xml"
+        second_feed = "https://two.example/feed.xml"
+        first_url = "https://pages.example/article?source=one"
+        second_url = "https://pages.example/article?source=two"
+        identity_url = "https://pages.example/article"
+        factory = FakeBackendFactory(
+            {
+                first_feed: FakeReply(rss_with_links(first_url)),
+                second_feed: FakeReply(rss_with_links(second_url)),
+                first_url: FakeReply(b"<html>shared</html>", "text/html"),
+            }
+        )
+        config = parse_config(
+            {
+                "webpages": {"atom": {}},
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [
+                    {
+                        "url": first_feed,
+                        "download-webpages": True,
+                        "webpage-ignore-query": True,
+                    },
+                    {
+                        "url": second_feed,
+                        "download-webpages": True,
+                        "webpage-ignore-query": True,
+                    },
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            self.assertEqual(
+                [call for call in factory.calls if call[0] == "webpage"],
+                [("webpage", first_url, "default")],
+            )
+            self.assertEqual(len(result["pages"]["pages"]), 1)
+            record = result["pages"]["pages"][0]
+            self.assertEqual(record["source_url"], first_url)
+            self.assertEqual(record["identity_url"], identity_url)
+            self.assertEqual(record["aliases"], [second_url])
+            self.assertEqual(
+                record["path"],
+                f"/pages/{webpage_relpath(identity_url)}",
+            )
+            self.assertEqual(
+                len(list(Path(directory, "pages").rglob("*.html"))),
+                1,
+            )
+            atom_hrefs = []
+            for feed_record in result["feeds"]["feeds"]:
+                atom_path = Path(
+                    directory,
+                    feed_record["atom_path"].removeprefix("/"),
+                )
+                atom_root = ET.fromstring(atom_path.read_bytes())
+                alternate = atom_root.find(
+                    "{http://www.w3.org/2005/Atom}entry/"
+                    "{http://www.w3.org/2005/Atom}link[@rel='alternate']"
+                )
+                self.assertIsNotNone(alternate)
+                atom_hrefs.append(alternate.attrib["href"])
+            self.assertEqual(len(set(atom_hrefs)), 1)
+
+    async def test_query_is_significant_by_default(self):
+        feed_url = "https://example.com/feed.xml"
+        first_url = "https://example.com/article?id=one"
+        second_url = "https://example.com/article?id=two"
+        factory = FakeBackendFactory(
+            {
+                feed_url: FakeReply(rss_with_links(first_url, second_url)),
+                first_url: FakeReply(b"<html>one</html>", "text/html"),
+                second_url: FakeReply(b"<html>two</html>", "text/html"),
+            }
+        )
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [{"url": feed_url, "download-webpages": True}],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            self.assertEqual(
+                [call for call in factory.calls if call[0] == "webpage"],
+                [
+                    ("webpage", first_url, "default"),
+                    ("webpage", second_url, "default"),
+                ],
+            )
+            self.assertEqual(len(result["pages"]["pages"]), 2)
+            self.assertTrue(
+                all(
+                    "identity_url" not in record
+                    for record in result["pages"]["pages"]
+                )
+            )
+
+    async def test_only_enabled_feeds_collapse_distinct_query_variants(self):
+        ignored_feed = "https://ignored.example/feed.xml"
+        sensitive_feed = "https://sensitive.example/feed.xml"
+        duplicate_feed = "https://duplicate.example/feed.xml"
+        first_url = "https://pages.example/article?id=one"
+        second_url = "https://pages.example/article?id=two"
+        factory = FakeBackendFactory(
+            {
+                ignored_feed: FakeReply(rss_with_links(first_url)),
+                sensitive_feed: FakeReply(rss_with_links(second_url)),
+                duplicate_feed: FakeReply(rss_with_links(first_url)),
+                first_url: FakeReply(b"<html>one</html>", "text/html"),
+                second_url: FakeReply(b"<html>two</html>", "text/html"),
+            }
+        )
+        config = parse_config(
+            {
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [
+                    {
+                        "url": ignored_feed,
+                        "download-webpages": True,
+                        "webpage-ignore-query": True,
+                    },
+                    {
+                        "url": sensitive_feed,
+                        "download-webpages": True,
+                    },
+                    {
+                        "url": duplicate_feed,
+                        "download-webpages": True,
+                    },
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(factory),
+            ).run()
+
+            self.assertEqual(
+                [call for call in factory.calls if call[0] == "webpage"],
+                [
+                    ("webpage", first_url, "default"),
+                    ("webpage", second_url, "default"),
+                ],
+            )
+            self.assertEqual(len(result["pages"]["pages"]), 2)
+
+    async def test_ignore_query_reuses_cache_for_a_new_query_variant(self):
+        feed_url = "https://example.com/feed.xml"
+        first_url = "https://example.com/article?tracking=one"
+        second_url = "https://example.com/article?tracking=two"
+        config = parse_config(
+            {
+                "webpages": {
+                    "refresh-policy": "missing-only",
+                },
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [
+                    {
+                        "url": feed_url,
+                        "download-webpages": True,
+                        "webpage-ignore-query": True,
+                    }
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(rss_with_links(first_url)),
+                            first_url: FakeReply(
+                                b"<html>cached</html>",
+                                "text/html",
+                            ),
+                        }
+                    )
+                ),
+            ).run()
+            second_factory = FakeBackendFactory(
+                {feed_url: FakeReply(rss_with_links(second_url))}
+            )
+
+            result = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(second_factory),
+            ).run()
+
+            self.assertEqual(second_factory.calls, [("rss", feed_url, "default")])
+            record = result["pages"]["pages"][0]
+            self.assertEqual(record["source_url"], first_url)
+            self.assertEqual(record["aliases"], [second_url])
+            self.assertEqual(record["status"], "skipped")
+
+    async def test_current_only_cleans_up_a_queryless_identity_path(self):
+        feed_url = "https://example.com/feed.xml"
+        page_url = "https://example.com/article?tracking=one"
+        config = parse_config(
+            {
+                "archive-current-only": True,
+                "downloaders": {"default": {"backend": "fake"}},
+                "feeds": [
+                    {
+                        "url": feed_url,
+                        "download-webpages": True,
+                        "webpage-ignore-query": True,
+                    }
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory(
+                        {
+                            feed_url: FakeReply(rss_with_links(page_url)),
+                            page_url: FakeReply(
+                                b"<html>old</html>",
+                                "text/html",
+                            ),
+                        }
+                    )
+                ),
+            ).run()
+            page_path = Path(
+                directory,
+                first["pages"]["pages"][0]["path"].removeprefix("/"),
+            )
+
+            second = await SyncEngine(
+                config,
+                root=directory,
+                registry=registry_with(
+                    FakeBackendFactory({feed_url: FakeReply(rss_with_links())})
+                ),
+            ).run()
+
+            self.assertEqual(second["pages"]["pages"], [])
+            self.assertFalse(page_path.exists())
+
     async def test_redirect_aliases_share_one_record_and_archive(self):
         feed_url = "https://feed.example/feed.xml"
         first_url = "https://example.com/start-a"

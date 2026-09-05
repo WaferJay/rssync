@@ -51,7 +51,8 @@
         {
             "url": "https://example.org/rss.xml",
             "download-webpages": true,
-            "webpage-refresh-policy": "on-rss-change"
+            "webpage-refresh-policy": "on-rss-change",
+            "webpage-ignore-query": true
         },
         {
             "url": "https://example.net/rss.xml",

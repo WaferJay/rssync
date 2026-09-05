@@ -66,8 +66,16 @@ def _remove_dot_segments(path: str) -> str:
     return output
 
 
-def canonicalize_http_url(url: str) -> str | None:
-    """Normalize an HTTP(S) URL for download identity and deduplication."""
+def canonicalize_http_url(
+    url: str,
+    *,
+    ignore_query: bool = False,
+) -> str | None:
+    """Normalize an HTTP(S) URL for download identity and deduplication.
+
+    ``ignore_query`` affects only the returned identity. Callers can therefore
+    deduplicate requests without removing the query from the URL they fetch.
+    """
 
     try:
         parsed = urlsplit(url)
@@ -88,7 +96,7 @@ def canonicalize_http_url(url: str) -> str | None:
         ):
             hostname = f"{hostname}:{port}"
         path = _remove_dot_segments(_normalize_percent_encoding(parsed.path or "/"))
-        query = _normalize_percent_encoding(parsed.query)
+        query = "" if ignore_query else _normalize_percent_encoding(parsed.query)
         return urlunsplit((scheme, hostname, path, query, ""))
     except (UnicodeError, ValueError):
         return None

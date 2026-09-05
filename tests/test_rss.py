@@ -32,6 +32,15 @@ class UrlCanonicalizationTest(unittest.TestCase):
             "https://example.com//article",
         )
 
+    def test_can_exclude_query_from_url_identity(self):
+        self.assertEqual(
+            canonicalize_http_url(
+                "https://EXAMPLE.com:443/article?tracking=one#section",
+                ignore_query=True,
+            ),
+            "https://example.com/article",
+        )
+
 
 class RssComparisonTest(unittest.TestCase):
     def test_ignored_tags_match_exact_local_name_in_any_namespace(self):

@@ -101,6 +101,7 @@ class FeedConfig:
     change_detection: RssChangeDetectionConfig = field(
         default_factory=RssChangeDetectionConfig
     )
+    webpage_ignore_query: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +333,7 @@ def _parse_feeds(
                 "download-webpages",
                 "webpage-downloader",
                 "webpage-refresh-policy",
+                "webpage-ignore-query",
                 "change-detection",
             },
             location,
@@ -358,6 +360,11 @@ def _parse_feeds(
         download_webpages = raw.get("download-webpages", False)
         if not isinstance(download_webpages, bool):
             raise ConfigError(f"{location}.download-webpages must be a boolean")
+        webpage_ignore_query = raw.get("webpage-ignore-query", False)
+        if not isinstance(webpage_ignore_query, bool):
+            raise ConfigError(
+                f"{location}.webpage-ignore-query must be a boolean"
+            )
         feeds.append(
             FeedConfig(
                 url=url,
@@ -372,6 +379,7 @@ def _parse_feeds(
                     f"{location}.webpage-refresh-policy",
                     refresh_registry,
                 ),
+                webpage_ignore_query=webpage_ignore_query,
                 change_detection=_parse_change_detection(
                     raw.get("change-detection"),
                     f"{location}.change-detection",
